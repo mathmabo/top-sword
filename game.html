@@ -1,0 +1,1576 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Fantasy RPG Village</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+    background: #0f0f1a;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    height: 100vh;
+    overflow: hidden;
+    font-family: 'Courier New', monospace;
+}
+canvas {
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+}
+#controls {
+    color: #887755;
+    margin-top: 10px;
+    font-size: 13px;
+    letter-spacing: 1px;
+}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="controls">WASD / Arrow Keys: Move &nbsp;&bull;&nbsp; X / J: Attack &nbsp;&bull;&nbsp; Shift: Dash &nbsp;&bull;&nbsp; Space: Interact &nbsp;&bull;&nbsp; R: Restart</div>
+<script>
+// ============================================================
+//  CONSTANTS
+// ============================================================
+const TILE    = 48;
+const FW      = 48;                // character frame width
+const FH      = 72;                // character frame height
+const MAP_W   = 32;
+const MAP_H   = 24;
+const VIEW_W  = 800;
+const VIEW_H  = 600;
+const ANIM_FPS   = 8;
+const WALK_SPEED = 2.5;
+const ATK_DURATION = 0.25;          // attack active time
+const ATK_COOLDOWN = 0.4;           // time between attacks
+const ATK_RANGE    = 42;            // sword reach in px
+const KNOCKBACK    = 550;           // knockback speed on hit
+const HIT_FREEZE   = 0.07;          // brief freeze-frame on hit
+const SWEEP_ANGLE  = Math.PI * 0.75;
+const DIR_ANGLE = { down: Math.PI*0.5, up: -Math.PI*0.5, left: Math.PI, right: 0 };
+const NPC_ATK_DURATION = 0.35;
+const NPC_ATK_COOLDOWN = 1.2;
+const NPC_ATK_RANGE    = 38;
+const NPC_CHASE_SPEED  = 1.8;
+const NPC_DEAGGRO_DIST = 10 * TILE;
+const PLAYER_MAX_HP    = 5;
+const NPC_MAX_HP       = 3;
+const PROJ_SPEED_MAGIC = 170;
+const PROJ_SPEED_ARROW = 260;
+const RANGED_WINDUP    = 0.4;
+const RANGED_FIRE_AT   = 0.15;        // fire when atkTimer falls to this
+const RANGED_COOLDOWN  = 1.8;
+const RANGED_DIST_MIN  = 3 * TILE;    // retreat if closer
+const RANGED_DIST_IDEAL= 6 * TILE;    // approach if farther
+const DASH_SPEED       = 9;
+const DASH_DURATION    = 0.12;
+const DASH_COOLDOWN    = 0.5;
+
+// Spritesheet row order (per character_tilesheet.md)
+const DIR_ROW = { down: 0, left: 1, right: 2, up: 3 };
+const DIR_DX  = { down: 0, left: -1, right: 1, up: 0 };
+const DIR_DY  = { down: 1, left: 0, right: 0, up: -1 };
+
+// ============================================================
+//  CANVAS
+// ============================================================
+const canvas = document.getElementById('game');
+const ctx    = canvas.getContext('2d');
+canvas.width  = VIEW_W;
+canvas.height = VIEW_H;
+
+// ============================================================
+//  ASSET LOADING
+// ============================================================
+const images = {};
+const assetList = {
+    player:   '3x/NPCs/NPC 05_walk (48x72).png',
+    elf:      '3x/NPCs/Elf_walk (48x72).png',
+    npc1:     '3x/NPCs/NPC 01_walk (48x72).png',
+    npc2:     '3x/NPCs/NPC 02_walk (48x72).png',
+    npc3:     '3x/NPCs/NPC 03_walk (48x72).png',
+    tree_m1:  '3x/Tileset/Tree_medium_1.png',
+    tree_m2:  '3x/Tileset/Tree_medium_2.png',
+    tree_s1:  '3x/Tileset/Tree_small_1.png',
+    tree_s2:  '3x/Tileset/Tree_small_2.png',
+    house1:   '3x/Tileset/House_1 (closed).png',
+    house2:   '3x/Tileset/House_2 (closed).png',
+    house3:   '3x/Tileset/House_3 (closed).png',
+    bush:     '3x/Tileset/Bush.png',
+    well1:    '3x/Tileset/Well_1.png',
+    rock1:    '3x/Tileset/Rock_1.png',
+    rock2:    '3x/Tileset/Rock_2.png',
+    flower1:  '3x/Tileset/Flower_1.png',
+    flower2:  '3x/Tileset/Flower_2.png',
+    flower3:  '3x/Tileset/Flower_3.png',
+    stone:    '3x/Tileset/Stone tile.png',
+    tallgrass:'3x/Tileset/Tall grass.png',
+};
+
+function loadAssets() {
+    return new Promise(resolve => {
+        let n = Object.keys(assetList).length;
+        for (const [key, src] of Object.entries(assetList)) {
+            const img = new Image();
+            img.onload = img.onerror = () => {
+                images[key] = img;
+                if (--n === 0) resolve();
+            };
+            img.src = src;
+        }
+    });
+}
+
+// ============================================================
+//  COLLISION GRID
+// ============================================================
+const collision = Array.from({ length: MAP_H }, () => new Uint8Array(MAP_W));
+
+function markBlocked(tx, ty, tw, th) {
+    for (let y = ty; y < ty + th && y < MAP_H; y++)
+        for (let x = tx; x < tx + tw && x < MAP_W; x++)
+            if (y >= 0 && x >= 0) collision[y][x] = 1;
+}
+
+function blocked(px, py, w, h) {
+    const corners = [
+        [px, py], [px + w - 1, py],
+        [px, py + h - 1], [px + w - 1, py + h - 1]
+    ];
+    for (const [cx, cy] of corners) {
+        const tx = Math.floor(cx / TILE);
+        const ty = Math.floor(cy / TILE);
+        if (tx < 0 || ty < 0 || tx >= MAP_W || ty >= MAP_H) return true;
+        if (collision[ty][tx]) return true;
+    }
+    return false;
+}
+
+// ============================================================
+//  WORLD DEFINITION
+// ============================================================
+const groundDeco  = [];   // flowers, tall grass (walkable)
+const worldObjs   = [];   // trees, houses, rocks, etc.
+const pathTiles   = [];   // stone path positions
+
+function buildWorld() {
+    // ---- Stone paths (cross through village) ----
+    for (let x = 3; x < MAP_W - 3; x++) {
+        pathTiles.push({ x, y: 12 });
+        pathTiles.push({ x, y: 13 });
+    }
+    for (let y = 3; y < MAP_H - 3; y++) {
+        pathTiles.push({ x: 15, y });
+        pathTiles.push({ x: 16, y });
+    }
+    // Paths to houses
+    for (let y = 7; y < 12; y++) { pathTiles.push({ x: 7, y }); pathTiles.push({ x: 24, y }); }
+    for (let y = 14; y < 19; y++) { pathTiles.push({ x: 7, y }); pathTiles.push({ x: 24, y }); }
+
+    // ---- Houses (240x240 = 5x5 tiles, collision on lower 3 rows) ----
+    worldObjs.push(
+        { img: 'house1', x: 4,  y: 3,  pw: 240, ph: 240, cX: 0, cY: 2, cW: 5, cH: 3 },
+        { img: 'house2', x: 22, y: 3,  pw: 240, ph: 240, cX: 0, cY: 2, cW: 5, cH: 3 },
+        { img: 'house3', x: 4,  y: 16, pw: 240, ph: 240, cX: 0, cY: 2, cW: 5, cH: 3 },
+        { img: 'house1', x: 22, y: 16, pw: 240, ph: 240, cX: 0, cY: 2, cW: 5, cH: 3 },
+    );
+
+    // ---- Well ----
+    worldObjs.push(
+        { img: 'well1', x: 14, y: 10, pw: 96, ph: 96, cX: 0, cY: 0, cW: 2, cH: 2 }
+    );
+
+    // ---- Trees around perimeter ----
+    const treeImgs = ['tree_m1', 'tree_m2', 'tree_s1', 'tree_s2'];
+    const pick = () => treeImgs[Math.floor(Math.random() * 4)];
+
+    for (let x = 0; x < MAP_W; x += 2)
+        worldObjs.push({ img: pick(), x, y: 0,  pw: 96, ph: 96, cX: 0, cY: 1, cW: 2, cH: 1 });
+    for (let x = 0; x < MAP_W; x += 2)
+        worldObjs.push({ img: pick(), x, y: MAP_H - 2, pw: 96, ph: 96, cX: 0, cY: 1, cW: 2, cH: 1 });
+    for (let y = 2; y < MAP_H - 2; y += 2)
+        worldObjs.push({ img: pick(), x: 0, y, pw: 96, ph: 96, cX: 0, cY: 1, cW: 2, cH: 1 });
+    for (let y = 2; y < MAP_H - 2; y += 2)
+        worldObjs.push({ img: pick(), x: MAP_W - 2, y, pw: 96, ph: 96, cX: 0, cY: 1, cW: 2, cH: 1 });
+
+    // Scattered interior trees
+    [[10,6],[20,6],[10,18],[20,18],[12,3],[18,3],[12,20],[18,20],[2,10],[28,10],[2,14],[28,14]]
+        .forEach(([x, y]) => worldObjs.push({ img: pick(), x, y, pw: 96, ph: 96, cX: 0, cY: 1, cW: 2, cH: 1 }));
+
+    // ---- Rocks ----
+    [[3,10],[27,8],[13,6],[18,18],[26,14],[9,15],[21,5]]
+        .forEach(([x, y]) => worldObjs.push({
+            img: Math.random() > 0.5 ? 'rock1' : 'rock2',
+            x, y, pw: 48, ph: 48, cX: 0, cY: 0, cW: 1, cH: 1
+        }));
+
+    // ---- Bushes ----
+    [[3,7],[8,9],[27,11],[22,9],[11,14],[20,14],[3,15],[26,5],[9,19]]
+        .forEach(([x, y]) => worldObjs.push({
+            img: 'bush', x, y, pw: 48, ph: 48, cX: 0, cY: 0, cW: 1, cH: 1
+        }));
+
+    // ---- Flowers (walkable) ----
+    const flowerImgs = ['flower1', 'flower2', 'flower3'];
+    for (let i = 0; i < 30; i++) {
+        const fx = 2 + Math.floor(Math.random() * (MAP_W - 4));
+        const fy = 2 + Math.floor(Math.random() * (MAP_H - 4));
+        groundDeco.push({ img: flowerImgs[i % 3], x: fx, y: fy });
+    }
+
+    // ---- Tall grass ----
+    for (let i = 0; i < 18; i++) {
+        const fx = 2 + Math.floor(Math.random() * (MAP_W - 4));
+        const fy = 2 + Math.floor(Math.random() * (MAP_H - 4));
+        groundDeco.push({ img: 'tallgrass', x: fx, y: fy });
+    }
+
+    // ---- Build collision from objects ----
+    for (const o of worldObjs)
+        markBlocked(o.x + (o.cX || 0), o.y + (o.cY || 0), o.cW, o.cH);
+}
+
+// ============================================================
+//  CHARACTER
+// ============================================================
+class Character {
+    constructor(spriteKey, tileX, tileY) {
+        this.sprite = spriteKey;
+        this.x = tileX * TILE;
+        this.y = tileY * TILE;
+        this.dir = 'down';
+        this.frame = 0;
+        this.animT = 0;
+        this.moving = false;
+        this.speed = WALK_SPEED;
+    }
+
+    update(dt) {
+        if (this.moving) {
+            this.animT += dt;
+            if (this.animT >= 1 / ANIM_FPS) {
+                this.animT -= 1 / ANIM_FPS;
+                this.frame = (this.frame + 1) % 4;
+            }
+        } else {
+            this.frame = 0;
+            this.animT = 0;
+        }
+    }
+
+    tryMove(dx, dy) {
+        if (dx < 0) this.dir = 'left';
+        else if (dx > 0) this.dir = 'right';
+        if (dy < 0) this.dir = 'up';
+        else if (dy > 0) this.dir = 'down';
+
+        const nx = this.x + dx * this.speed;
+        const ny = this.y + dy * this.speed;
+
+        // Foot collision box (centered bottom)
+        const bw = 20, bh = 14;
+        const bx = nx + (FW - bw) / 2;
+        const by = ny + FH - bh;
+
+        if (!blocked(bx, by, bw, bh)) {
+            this.x = nx;
+            this.y = ny;
+        }
+        this.moving = true;
+    }
+
+    draw(cx, cy) {
+        const img = images[this.sprite];
+        if (!img) return;
+        ctx.drawImage(
+            img,
+            this.frame * FW, DIR_ROW[this.dir] * FH, FW, FH,
+            Math.round(this.x - cx), Math.round(this.y - cy), FW, FH
+        );
+    }
+
+    get sortY() { return this.y + FH; }
+}
+
+// ============================================================
+//  NPC (wandering AI)
+// ============================================================
+class NPC extends Character {
+    constructor(spriteKey, tileX, tileY, dialogue) {
+        super(spriteKey, tileX, tileY);
+        this.dialogue = dialogue;
+        this.speed = 1.0;
+        this.wTimer = 2 + Math.random() * 3;
+        this.wDir = null;
+        this.homeX = tileX * TILE;
+        this.homeY = tileY * TILE;
+        this.wRadius = 3 * TILE;
+        // Combat
+        this.hp = NPC_MAX_HP;
+        this.hitTimer = 0;
+        this.hitInvuln = 0;
+        this.knockVx = 0;
+        this.knockVy = 0;
+        this.aggro = false;
+        this.atkTimer = 0;
+        this.atkCooldown = 0;
+        this.atkHit = false;
+        this.alive = true;
+        this.respawnTimer = 0;
+        // Ranged
+        this.ranged = false;
+        this.projType = 'magic';
+        this.rangedCooldown = 0;
+        this.fireQueued = false;
+    }
+
+    faceToward(target) {
+        const ddx = target.x - this.x;
+        const ddy = target.y - this.y;
+        if (Math.abs(ddx) > Math.abs(ddy))
+            this.dir = ddx < 0 ? 'left' : 'right';
+        else
+            this.dir = ddy < 0 ? 'up' : 'down';
+    }
+
+    update(dt, player) {
+        // Respawn
+        if (!this.alive) {
+            this.respawnTimer -= dt;
+            if (this.respawnTimer <= 0) {
+                this.alive = true;
+                this.hp = NPC_MAX_HP;
+                this.x = this.homeX;
+                this.y = this.homeY;
+                this.aggro = false;
+                this.moving = false;
+                this.atkTimer = 0;
+                this.atkCooldown = 0;
+                spawnParticles(this.x + FW / 2, this.y + FH / 2, '#88ff88', 10);
+            }
+            return;
+        }
+
+        // Hit timers
+        if (this.hitTimer > 0) this.hitTimer -= dt;
+        if (this.hitInvuln > 0) this.hitInvuln -= dt;
+        if (this.atkCooldown > 0) this.atkCooldown -= dt;
+
+        // Death
+        if (this.hp <= 0) {
+            this.alive = false;
+            this.respawnTimer = 8;
+            this.aggro = false;
+            spawnParticles(this.x + FW / 2, this.y + FH / 2, '#ff6644', 15);
+            spawnParticles(this.x + FW / 2, this.y + FH / 2, '#ffcc00', 10);
+            return;
+        }
+
+        // Knockback physics
+        if (Math.abs(this.knockVx) > 1 || Math.abs(this.knockVy) > 1) {
+            const bw = 20, bh = 14;
+            const nx = this.x + this.knockVx * dt;
+            const ny = this.y + this.knockVy * dt;
+            if (!blocked(nx + (FW - bw) / 2, ny + FH - bh, bw, bh)) {
+                this.x = nx;
+                this.y = ny;
+            } else {
+                // Bounce off walls slightly
+                this.knockVx *= -0.3;
+                this.knockVy *= -0.3;
+            }
+            this.knockVx *= 0.91;
+            this.knockVy *= 0.91;
+            this.moving = false;
+            super.update(dt);
+            return;
+        }
+
+        const distP = Math.hypot(player.x - this.x, player.y - this.y);
+
+        // ---- Aggro behavior ----
+        if (this.aggro) {
+            // De-aggro if player is far away
+            if (distP > NPC_DEAGGRO_DIST) {
+                this.aggro = false;
+                this.wTimer = 1;
+                this.moving = false;
+                super.update(dt);
+                return;
+            }
+
+            // ---- Ranged AI ----
+            if (this.ranged) {
+                this.faceToward(player);
+                if (this.rangedCooldown > 0) this.rangedCooldown -= dt;
+
+                if (distP < RANGED_DIST_MIN) {
+                    // Too close - retreat
+                    const away = Math.atan2(this.y - player.y, this.x - player.x);
+                    const prev = this.speed;
+                    this.speed = NPC_CHASE_SPEED;
+                    this.tryMove(Math.cos(away), Math.sin(away));
+                    this.speed = prev;
+                } else if (distP > RANGED_DIST_IDEAL) {
+                    // Too far - approach
+                    const a = Math.atan2(player.y - this.y, player.x - this.x);
+                    const prev = this.speed;
+                    this.speed = NPC_CHASE_SPEED * 0.7;
+                    this.tryMove(Math.cos(a), Math.sin(a));
+                    this.speed = prev;
+                } else {
+                    // In range - fire
+                    this.moving = false;
+                    if (this.rangedCooldown <= 0 && this.atkTimer <= 0) {
+                        this.atkTimer = RANGED_WINDUP;
+                        this.fireQueued = true;
+                    }
+                }
+
+                if (this.atkTimer > 0) {
+                    this.atkTimer -= dt;
+                    this.moving = false;
+                    if (this.atkTimer <= RANGED_FIRE_AT && this.fireQueued) {
+                        this.fireQueued = false;
+                        this.rangedCooldown = RANGED_COOLDOWN;
+                        fireProjectile(this, player.x + FW / 2, player.y + FH / 2, this.projType);
+                    }
+                }
+                super.update(dt);
+                return;
+            }
+
+            // ---- Melee AI ----
+            if (distP < TILE * 1.5 && this.atkCooldown <= 0 && this.atkTimer <= 0) {
+                this.faceToward(player);
+                this.atkTimer = NPC_ATK_DURATION;
+                this.atkCooldown = NPC_ATK_COOLDOWN;
+                this.atkHit = false;
+                this.moving = false;
+            }
+            else if (this.atkTimer <= 0) {
+                const a = Math.atan2(player.y - this.y, player.x - this.x);
+                const prevSpd = this.speed;
+                this.speed = NPC_CHASE_SPEED;
+                this.tryMove(Math.cos(a), Math.sin(a));
+                this.speed = prevSpd;
+            } else {
+                this.moving = false;
+            }
+
+            if (this.atkTimer > 0) this.atkTimer -= dt;
+            super.update(dt);
+            return;
+        }
+
+        // ---- Peaceful wander ----
+        this.wTimer -= dt;
+        if (this.wTimer <= 0) {
+            if (!this.wDir) {
+                this.wDir = ['up', 'down', 'left', 'right'][Math.floor(Math.random() * 4)];
+                this.wTimer = 0.5 + Math.random() * 1.5;
+            } else {
+                this.wDir = null;
+                this.wTimer = 1.5 + Math.random() * 3;
+                this.moving = false;
+            }
+        }
+        if (this.wDir) {
+            const dx = DIR_DX[this.wDir], dy = DIR_DY[this.wDir];
+            const nx = this.x + dx * this.speed;
+            const ny = this.y + dy * this.speed;
+            if (Math.hypot(nx - this.homeX, ny - this.homeY) < this.wRadius) {
+                this.tryMove(dx, dy);
+            } else {
+                this.wDir = null;
+                this.wTimer = 1;
+                this.moving = false;
+            }
+        }
+        super.update(dt);
+    }
+
+    draw(cx, cy) {
+        if (!this.alive) return;
+        if (this.hitInvuln > 0 && Math.floor(this.hitInvuln * 20) % 2 === 0) return;
+        super.draw(cx, cy);
+    }
+}
+
+// ============================================================
+//  INPUT
+// ============================================================
+const keys = {};
+window.addEventListener('keydown', e => {
+    keys[e.code] = true;
+    if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space','KeyX','KeyJ','ShiftLeft','ShiftRight'].includes(e.code))
+        e.preventDefault();
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+// ============================================================
+//  CAMERA
+// ============================================================
+const cam = { x: 0, y: 0 };
+
+function updateCam(target) {
+    const tx = target.x + FW / 2 - VIEW_W / 2;
+    const ty = target.y + FH / 2 - VIEW_H / 2;
+    cam.x += (tx - cam.x) * 0.08;
+    cam.y += (ty - cam.y) * 0.08;
+    cam.x = Math.max(0, Math.min(cam.x, MAP_W * TILE - VIEW_W));
+    cam.y = Math.max(0, Math.min(cam.y, MAP_H * TILE - VIEW_H));
+}
+
+// ============================================================
+//  DIALOGUE
+// ============================================================
+let dlgText = '';
+let dlgTimer = 0;
+
+function showDlg(text) { dlgText = text; dlgTimer = 3; }
+
+function drawDlg() {
+    if (dlgTimer <= 0) return;
+
+    ctx.font = '16px "Courier New", monospace';
+    const tw = ctx.measureText(dlgText).width;
+    const pad = 20;
+    const w = tw + pad * 2;
+    const h = 48;
+    const x = (VIEW_W - w) / 2;
+    const y = VIEW_H - h - 24;
+
+    // Box
+    ctx.fillStyle = 'rgba(20, 12, 8, 0.9)';
+    ctx.strokeStyle = '#c8a86e';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.roundRect(x, y, w, h, 6);
+    ctx.fill();
+    ctx.stroke();
+
+    // Text
+    ctx.fillStyle = '#f0e6d0';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(dlgText, VIEW_W / 2, y + h / 2);
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+}
+
+// ============================================================
+//  RENDERING
+// ============================================================
+const GRASS_A = '#5a8a2f';
+const GRASS_B = '#4f7d28';
+
+function renderGround() {
+    ctx.fillStyle = GRASS_A;
+    ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+
+    const sx = Math.floor(cam.x / TILE);
+    const sy = Math.floor(cam.y / TILE);
+    const ex = Math.min(MAP_W, sx + Math.ceil(VIEW_W / TILE) + 2);
+    const ey = Math.min(MAP_H, sy + Math.ceil(VIEW_H / TILE) + 2);
+
+    // Subtle checkerboard grass
+    ctx.fillStyle = GRASS_B;
+    for (let ty = sy; ty < ey; ty++)
+        for (let tx = sx; tx < ex; tx++)
+            if ((tx + ty) % 2 === 0)
+                ctx.fillRect(
+                    Math.round(tx * TILE - cam.x),
+                    Math.round(ty * TILE - cam.y),
+                    TILE, TILE
+                );
+
+    // Stone paths
+    if (images.stone) {
+        for (const p of pathTiles) {
+            const px = Math.round(p.x * TILE - cam.x);
+            const py = Math.round(p.y * TILE - cam.y);
+            if (px > -TILE && px < VIEW_W && py > -TILE && py < VIEW_H)
+                ctx.drawImage(images.stone, px, py);
+        }
+    }
+
+    // Ground decorations
+    for (const d of groundDeco) {
+        const img = images[d.img];
+        if (!img) continue;
+        const px = Math.round(d.x * TILE - cam.x);
+        const py = Math.round(d.y * TILE - cam.y);
+        if (px > -TILE && px < VIEW_W && py > -TILE && py < VIEW_H)
+            ctx.drawImage(img, px, py);
+    }
+}
+
+function renderScene(player, npcs) {
+    const list = [];
+
+    // World objects
+    for (const o of worldObjs) {
+        const img = images[o.img];
+        if (!img) continue;
+        const px = Math.round(o.x * TILE - cam.x);
+        const py = Math.round(o.y * TILE - cam.y);
+        if (px > -o.pw && px < VIEW_W && py > -o.ph && py < VIEW_H)
+            list.push({
+                sortY: (o.y * TILE) + o.ph,
+                draw() { ctx.drawImage(img, px, py); }
+            });
+    }
+
+    // Player (with hit flicker)
+    list.push({ sortY: player.sortY, draw() {
+        if (player.hitInvuln > 0 && Math.floor(player.hitInvuln * 20) % 2 === 0) return;
+        player.draw(cam.x, cam.y);
+    } });
+    for (const npc of npcs)
+        list.push({ sortY: npc.sortY, draw() { npc.draw(cam.x, cam.y); } });
+
+    list.sort((a, b) => a.sortY - b.sortY);
+    for (const item of list) item.draw();
+}
+
+// Shadow under characters
+function drawShadow(char) {
+    const sx = Math.round(char.x + FW / 2 - cam.x);
+    const sy = Math.round(char.y + FH - 6 - cam.y);
+    ctx.fillStyle = 'rgba(0,0,0,0.2)';
+    ctx.beginPath();
+    ctx.ellipse(sx, sy, 14, 5, 0, 0, Math.PI * 2);
+    ctx.fill();
+}
+
+// ============================================================
+//  PARTICLES
+// ============================================================
+const particles = [];
+
+function spawnParticles(wx, wy, color, count) {
+    for (let i = 0; i < count; i++) {
+        const a = Math.random() * Math.PI * 2;
+        const sp = 50 + Math.random() * 100;
+        const life = 0.2 + Math.random() * 0.3;
+        particles.push({
+            x: wx, y: wy,
+            vx: Math.cos(a) * sp, vy: Math.sin(a) * sp,
+            life, maxLife: life,
+            size: 2 + Math.random() * 3, color
+        });
+    }
+}
+
+function updateParticles(dt) {
+    for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.x += p.vx * dt;
+        p.y += p.vy * dt;
+        p.vy += 120 * dt; // gravity
+        p.life -= dt;
+        if (p.life <= 0) particles.splice(i, 1);
+    }
+}
+
+function drawParticles() {
+    for (const p of particles) {
+        ctx.globalAlpha = p.life / p.maxLife;
+        ctx.fillStyle = p.color;
+        const sz = p.size * (p.life / p.maxLife);
+        ctx.fillRect(
+            Math.round(p.x - cam.x - sz / 2),
+            Math.round(p.y - cam.y - sz / 2),
+            sz, sz
+        );
+    }
+    ctx.globalAlpha = 1;
+}
+
+// ============================================================
+//  SCREEN SHAKE
+// ============================================================
+let shakeTimer = 0;
+let shakeIntensity = 0;
+let freezeTimer = 0;
+
+// ============================================================
+//  SWORD SLASH EFFECT
+// ============================================================
+function drawSwordSlash(player) {
+    if (!player.atkTimer || player.atkTimer <= 0) return;
+
+    const progress = 1 - (player.atkTimer / ATK_DURATION);
+    const cx = Math.round(player.x + FW / 2 - cam.x);
+    const cy = Math.round(player.y + FH * 0.45 - cam.y);
+    const base = DIR_ANGLE[player.dir];
+    const start = base - SWEEP_ANGLE / 2;
+    const current = start + progress * SWEEP_ANGLE;
+    const fade = 1 - progress;
+
+    ctx.save();
+
+    // Outer glow arc
+    ctx.strokeStyle = `rgba(255, 220, 80, ${0.25 * fade})`;
+    ctx.lineWidth = 14;
+    ctx.beginPath();
+    ctx.arc(cx, cy, ATK_RANGE, start, current);
+    ctx.stroke();
+
+    // Main slash arc
+    ctx.strokeStyle = `rgba(255, 250, 220, ${0.7 * fade})`;
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.arc(cx, cy, ATK_RANGE, start, current);
+    ctx.stroke();
+
+    // Inner bright arc (thinner, brighter)
+    ctx.strokeStyle = `rgba(255, 255, 255, ${0.9 * fade})`;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(cx, cy, ATK_RANGE - 3, current - 0.3, current);
+    ctx.stroke();
+
+    // Sword blade
+    const bladeEnd = ATK_RANGE + 6;
+    const ex = cx + Math.cos(current) * bladeEnd;
+    const ey = cy + Math.sin(current) * bladeEnd;
+    const hx = cx + Math.cos(current) * 12;
+    const hy = cy + Math.sin(current) * 12;
+
+    // Blade shadow
+    ctx.strokeStyle = `rgba(80, 60, 40, ${0.6 * fade})`;
+    ctx.lineWidth = 5;
+    ctx.beginPath();
+    ctx.moveTo(hx, hy);
+    ctx.lineTo(ex, ey);
+    ctx.stroke();
+
+    // Blade
+    ctx.strokeStyle = `rgba(220, 215, 200, ${fade})`;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(hx, hy);
+    ctx.lineTo(ex, ey);
+    ctx.stroke();
+
+    // Blade edge highlight
+    const perpX = -Math.sin(current);
+    const perpY = Math.cos(current);
+    ctx.strokeStyle = `rgba(255, 255, 255, ${0.8 * fade})`;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(hx + perpX, hy + perpY);
+    ctx.lineTo(ex + perpX * 0.5, ey + perpY * 0.5);
+    ctx.stroke();
+
+    // Tip sparkle
+    ctx.fillStyle = `rgba(255, 255, 240, ${fade})`;
+    ctx.beginPath();
+    ctx.arc(ex, ey, 3 * fade, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.restore();
+}
+
+// ============================================================
+//  PROJECTILE SYSTEM
+// ============================================================
+const projectiles = [];
+
+function fireProjectile(npc, targetX, targetY, type) {
+    const sx = npc.x + FW / 2;
+    const sy = npc.y + FH * 0.4;
+    const angle = Math.atan2(targetY - sy, targetX - sx);
+    const speed = type === 'magic' ? PROJ_SPEED_MAGIC : PROJ_SPEED_ARROW;
+    projectiles.push({
+        x: sx, y: sy,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed,
+        life: 3.5,
+        type,
+        radius: type === 'magic' ? 7 : 4,
+        deflected: false,
+        trail: []
+    });
+    spawnParticles(sx, sy, type === 'magic' ? '#aa44ff' : '#cc8833', 6);
+}
+
+function updateProjectiles(dt, player, npcs) {
+    let killedPlayer = false;
+    for (let i = projectiles.length - 1; i >= 0; i--) {
+        const p = projectiles[i];
+        p.trail.push({ x: p.x, y: p.y });
+        if (p.trail.length > 6) p.trail.shift();
+
+        p.x += p.vx * dt;
+        p.y += p.vy * dt;
+        p.life -= dt;
+
+        if (p.life <= 0 || p.x < -TILE || p.x > (MAP_W+1)*TILE || p.y < -TILE || p.y > (MAP_H+1)*TILE) {
+            projectiles.splice(i, 1);
+            continue;
+        }
+
+        // --- Deflect by player sword ---
+        if (!p.deflected && player.atkTimer > 0) {
+            const pcx = player.x + FW / 2;
+            const pcy = player.y + FH * 0.45;
+            if (Math.hypot(p.x - pcx, p.y - pcy) < ATK_RANGE + p.radius + 4) {
+                const a = Math.atan2(p.y - pcy, p.x - pcx);
+                const spd = Math.hypot(p.vx, p.vy) * 1.6;
+                p.vx = Math.cos(a) * spd;
+                p.vy = Math.sin(a) * spd;
+                p.deflected = true;
+                p.life = 3.0;
+                spawnParticles(p.x, p.y, '#ffffff', 8);
+                spawnParticles(p.x, p.y, '#ffee44', 4);
+                shakeTimer = 0.06;
+                shakeIntensity = 2;
+                continue;
+            }
+        }
+
+        // --- Hit player ---
+        if (!p.deflected && player.hitInvuln <= 0 && !player.dashing) {
+            const dx = p.x - (player.x + FW / 2);
+            const dy = p.y - (player.y + FH / 2);
+            if (Math.hypot(dx, dy) < p.radius + 14) {
+                player.hp--;
+                player.hitInvuln = 1.0;
+                const pa = Math.atan2(p.vy, p.vx);
+                player.knockVx = Math.cos(pa) * KNOCKBACK * 0.6;
+                player.knockVy = Math.sin(pa) * KNOCKBACK * 0.6;
+                spawnParticles(p.x, p.y, p.type === 'magic' ? '#bb66ff' : '#ff8844', 10);
+                spawnParticles(p.x, p.y, '#ffffff', 4);
+                shakeTimer = 0.14;
+                shakeIntensity = 5;
+                freezeTimer = HIT_FREEZE;
+                projectiles.splice(i, 1);
+                if (player.hp <= 0) killedPlayer = true;
+                continue;
+            }
+        }
+
+        // --- Deflected projectiles hit NPCs ---
+        if (p.deflected) {
+            let hit = false;
+            for (const npc of npcs) {
+                if (!npc.alive || npc.hitInvuln > 0) continue;
+                const ncx = npc.x + FW / 2;
+                const ncy = npc.y + FH / 2;
+                if (Math.hypot(p.x - ncx, p.y - ncy) < p.radius + 18) {
+                    npc.hp--;
+                    npc.hitTimer = 0.3;
+                    npc.hitInvuln = 0.8;
+                    npc.aggro = true;
+                    const pa = Math.atan2(p.vy, p.vx);
+                    npc.knockVx = Math.cos(pa) * KNOCKBACK * 0.7;
+                    npc.knockVy = Math.sin(pa) * KNOCKBACK * 0.7;
+                    spawnParticles(ncx, ncy, '#ffdd44', 10);
+                    spawnParticles(ncx, ncy, '#ffffff', 5);
+                    shakeTimer = 0.12;
+                    shakeIntensity = 4;
+                    freezeTimer = HIT_FREEZE;
+                    projectiles.splice(i, 1);
+                    hit = true;
+                    break;
+                }
+            }
+            if (hit) continue;
+        }
+    }
+    return killedPlayer;
+}
+
+function drawProjectiles() {
+    for (const p of projectiles) {
+        const sx = Math.round(p.x - cam.x);
+        const sy = Math.round(p.y - cam.y);
+
+        // Trail
+        for (let t = 0; t < p.trail.length; t++) {
+            const alpha = (t + 1) / p.trail.length * 0.35;
+            const sz = p.radius * ((t + 1) / p.trail.length);
+            ctx.globalAlpha = alpha;
+            ctx.fillStyle = p.deflected ? '#ffee88' : (p.type === 'magic' ? '#9944ff' : '#aa7744');
+            const tx = Math.round(p.trail[t].x - cam.x);
+            const ty = Math.round(p.trail[t].y - cam.y);
+            ctx.beginPath();
+            ctx.arc(tx, ty, sz, 0, Math.PI * 2);
+            ctx.fill();
+        }
+        ctx.globalAlpha = 1;
+
+        if (p.type === 'magic') {
+            // Outer glow
+            ctx.fillStyle = p.deflected ? 'rgba(255,220,100,0.2)' : 'rgba(140,70,255,0.2)';
+            ctx.beginPath(); ctx.arc(sx, sy, p.radius + 6, 0, Math.PI * 2); ctx.fill();
+            // Core
+            ctx.fillStyle = p.deflected ? '#ffee88' : '#bb66ff';
+            ctx.beginPath(); ctx.arc(sx, sy, p.radius, 0, Math.PI * 2); ctx.fill();
+            // Center
+            ctx.fillStyle = '#fff';
+            ctx.beginPath(); ctx.arc(sx, sy, p.radius * 0.35, 0, Math.PI * 2); ctx.fill();
+        } else {
+            // Arrow shaft
+            const a = Math.atan2(p.vy, p.vx);
+            const len = 12;
+            const tipX = sx + Math.cos(a) * len, tipY = sy + Math.sin(a) * len;
+            const tailX = sx - Math.cos(a) * len, tailY = sy - Math.sin(a) * len;
+            ctx.strokeStyle = p.deflected ? '#ffdd44' : '#7B3F00';
+            ctx.lineWidth = 2;
+            ctx.beginPath(); ctx.moveTo(tailX, tailY); ctx.lineTo(tipX, tipY); ctx.stroke();
+            // Arrowhead
+            ctx.fillStyle = p.deflected ? '#fff' : '#bbb';
+            ctx.beginPath();
+            ctx.moveTo(tipX, tipY);
+            ctx.lineTo(tipX - Math.cos(a - 0.5) * 7, tipY - Math.sin(a - 0.5) * 7);
+            ctx.lineTo(tipX - Math.cos(a + 0.5) * 7, tipY - Math.sin(a + 0.5) * 7);
+            ctx.closePath(); ctx.fill();
+            // Fletching
+            ctx.strokeStyle = p.deflected ? '#ffcc44' : '#996633';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(tailX, tailY);
+            ctx.lineTo(tailX - Math.cos(a - 0.6) * 5, tailY - Math.sin(a - 0.6) * 5);
+            ctx.moveTo(tailX, tailY);
+            ctx.lineTo(tailX - Math.cos(a + 0.6) * 5, tailY - Math.sin(a + 0.6) * 5);
+            ctx.stroke();
+        }
+    }
+}
+
+// ============================================================
+//  NPC CHARGE-UP VISUAL (ranged wind-up)
+// ============================================================
+function drawNpcCharge(npc) {
+    if (!npc.alive || !npc.ranged || !npc.aggro || npc.atkTimer <= 0) return;
+    const progress = 1 - (npc.atkTimer / RANGED_WINDUP);
+    const cx = Math.round(npc.x + FW / 2 - cam.x);
+    const cy = Math.round(npc.y + FH * 0.3 - cam.y);
+    const r = progress * 11;
+
+    // Glow
+    const isMagic = npc.projType === 'magic';
+    ctx.fillStyle = isMagic ? `rgba(140,70,255,${0.3*progress})` : `rgba(200,150,50,${0.3*progress})`;
+    ctx.beginPath(); ctx.arc(cx, cy, r + 5, 0, Math.PI * 2); ctx.fill();
+    // Core
+    ctx.fillStyle = isMagic ? '#bb66ff' : '#ffaa44';
+    ctx.beginPath(); ctx.arc(cx, cy, r * 0.6, 0, Math.PI * 2); ctx.fill();
+    // Bright center
+    ctx.fillStyle = '#fff';
+    ctx.beginPath(); ctx.arc(cx, cy, r * 0.25, 0, Math.PI * 2); ctx.fill();
+
+    // Orbiting sparkles
+    const t = performance.now() / 200;
+    for (let k = 0; k < 3; k++) {
+        const a = t + k * Math.PI * 2 / 3;
+        const ox = cx + Math.cos(a) * (r + 3);
+        const oy = cy + Math.sin(a) * (r + 3);
+        ctx.fillStyle = isMagic ? '#ddaaff' : '#ffcc66';
+        ctx.beginPath(); ctx.arc(ox, oy, 2, 0, Math.PI * 2); ctx.fill();
+    }
+}
+
+// ============================================================
+//  NPC SLASH EFFECT (red-tinted, melee only)
+// ============================================================
+function drawNpcSlash(npc) {
+    if (!npc.alive || !npc.aggro || npc.atkTimer <= 0 || npc.ranged) return;
+
+    const progress = 1 - (npc.atkTimer / NPC_ATK_DURATION);
+    const cx = Math.round(npc.x + FW / 2 - cam.x);
+    const cy = Math.round(npc.y + FH * 0.45 - cam.y);
+    const base = DIR_ANGLE[npc.dir];
+    const start = base - SWEEP_ANGLE / 2;
+    const current = start + progress * SWEEP_ANGLE;
+    const fade = 1 - progress;
+
+    ctx.save();
+    ctx.strokeStyle = `rgba(255, 80, 60, ${0.3 * fade})`;
+    ctx.lineWidth = 12;
+    ctx.beginPath();
+    ctx.arc(cx, cy, NPC_ATK_RANGE, start, current);
+    ctx.stroke();
+
+    ctx.strokeStyle = `rgba(255, 120, 80, ${0.7 * fade})`;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(cx, cy, NPC_ATK_RANGE, start, current);
+    ctx.stroke();
+
+    ctx.strokeStyle = `rgba(255, 200, 160, ${0.9 * fade})`;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(cx, cy, NPC_ATK_RANGE - 3, current - 0.3, current);
+    ctx.stroke();
+
+    // Blade
+    const bladeEnd = NPC_ATK_RANGE + 5;
+    const ex = cx + Math.cos(current) * bladeEnd;
+    const ey = cy + Math.sin(current) * bladeEnd;
+    const hx = cx + Math.cos(current) * 12;
+    const hy = cy + Math.sin(current) * 12;
+    ctx.strokeStyle = `rgba(180, 60, 40, ${0.6 * fade})`;
+    ctx.lineWidth = 5;
+    ctx.beginPath(); ctx.moveTo(hx, hy); ctx.lineTo(ex, ey); ctx.stroke();
+    ctx.strokeStyle = `rgba(255, 180, 150, ${fade})`;
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(hx, hy); ctx.lineTo(ex, ey); ctx.stroke();
+    ctx.restore();
+}
+
+// ============================================================
+//  AGGRO INDICATOR + NPC HP BAR
+// ============================================================
+function drawAggroMark(npc) {
+    if (!npc.alive || !npc.aggro) return;
+    const sx = Math.round(npc.x + FW / 2 - cam.x);
+    const sy = Math.round(npc.y - 20 - cam.y);
+
+    // Red "!" above health bar
+    ctx.font = 'bold 16px "Courier New", monospace';
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ff3333';
+    ctx.fillText('!', sx, sy);
+    ctx.textAlign = 'left';
+}
+
+function drawNpcHpBar(npc) {
+    if (!npc.alive || !npc.aggro) return;
+    const maxHp = npc.ranged && npc.projType === 'magic' ? 2 : NPC_MAX_HP;
+    const cx = Math.round(npc.x + FW / 2 - cam.x);
+    const sy = Math.round(npc.y - 8 - cam.y);
+    const w = 36, h = 5;
+    const sx = cx - w / 2;
+    const ratio = Math.max(0, npc.hp / maxHp);
+
+    // Background
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.beginPath();
+    ctx.roundRect(sx - 1, sy - 1, w + 2, h + 2, 2);
+    ctx.fill();
+
+    // Bar fill
+    const barColor = ratio > 0.5 ? '#44cc44' : ratio > 0.25 ? '#ddaa22' : '#dd3333';
+    if (ratio > 0) {
+        ctx.fillStyle = barColor;
+        ctx.beginPath();
+        ctx.roundRect(sx, sy, w * ratio, h, 1);
+        ctx.fill();
+    }
+
+    // Highlight on top edge
+    ctx.fillStyle = `rgba(255,255,255,0.2)`;
+    ctx.fillRect(sx, sy, w * ratio, 1);
+
+    // Border
+    ctx.strokeStyle = 'rgba(0,0,0,0.4)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.roundRect(sx - 1, sy - 1, w + 2, h + 2, 2);
+    ctx.stroke();
+}
+
+// ============================================================
+//  AFTERIMAGES (dash trail)
+// ============================================================
+function drawAfterimages(player) {
+    const img = images[player.sprite];
+    if (!img) return;
+    for (const ai of player.afterimages) {
+        ctx.save();
+        ctx.globalAlpha = ai.alpha * 0.5;
+        ctx.filter = 'brightness(1.4) saturate(0.3)';
+        ctx.drawImage(
+            img,
+            ai.frame * FW, DIR_ROW[ai.dir] * FH, FW, FH,
+            Math.round(ai.x - cam.x), Math.round(ai.y - cam.y), FW, FH
+        );
+        ctx.restore();
+    }
+}
+
+// ============================================================
+//  GAME OVER SCREEN
+// ============================================================
+function drawGameOver() {
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+    ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+
+    ctx.fillStyle = '#cc3333';
+    ctx.font = 'bold 36px "Courier New", monospace';
+    ctx.fillText('DEFEATED', VIEW_W / 2, VIEW_H / 2 - 30);
+
+    ctx.fillStyle = '#c8a86e';
+    ctx.font = '16px "Courier New", monospace';
+    ctx.fillText('Press R to try again', VIEW_W / 2, VIEW_H / 2 + 20);
+
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+}
+
+// ============================================================
+//  HUD
+// ============================================================
+function drawHUD(p) {
+    ctx.fillStyle = 'rgba(20, 12, 8, 0.7)';
+    ctx.beginPath();
+    ctx.roundRect(10, 10, 210, 32, 4);
+    ctx.fill();
+    ctx.strokeStyle = '#c8a86e';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    ctx.fillStyle = '#c8a86e';
+    ctx.font = 'bold 14px "Courier New", monospace';
+    ctx.fillText('Fantasy RPG Village', 22, 31);
+
+    // HP hearts
+    const hx = 12, hy = 48;
+    ctx.font = '18px serif';
+    for (let i = 0; i < PLAYER_MAX_HP; i++) {
+        ctx.fillStyle = i < p.hp ? '#ee3344' : '#442222';
+        ctx.fillText('\u2665', hx + i * 22, hy + 16);
+    }
+
+    // Dash cooldown indicator
+    const dashX = 12, dashY = 74;
+    ctx.font = 'bold 12px "Courier New", monospace';
+    if (p.dashing) {
+        ctx.fillStyle = '#88ccff';
+        ctx.fillText('DASH', dashX, dashY);
+    } else if (p.dashCooldown > 0) {
+        ctx.fillStyle = '#555555';
+        ctx.fillText('DASH', dashX, dashY);
+        // Cooldown bar
+        const barW = 40, barH = 4;
+        const fill = 1 - (p.dashCooldown / DASH_COOLDOWN);
+        ctx.fillStyle = '#333333';
+        ctx.fillRect(dashX + 46, dashY - 8, barW, barH);
+        ctx.fillStyle = '#6688aa';
+        ctx.fillRect(dashX + 46, dashY - 8, barW * fill, barH);
+    } else {
+        ctx.fillStyle = '#88ccff';
+        ctx.fillText('DASH', dashX, dashY);
+        ctx.fillStyle = '#88ccff';
+        ctx.font = '10px "Courier New", monospace';
+        ctx.fillText('READY', dashX + 46, dashY);
+    }
+}
+
+// ============================================================
+//  MAIN
+// ============================================================
+async function main() {
+    // Loading screen
+    ctx.fillStyle = '#0f0f1a';
+    ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+    ctx.fillStyle = '#c8a86e';
+    ctx.font = '18px "Courier New", monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('Loading assets...', VIEW_W / 2, VIEW_H / 2);
+    ctx.textAlign = 'left';
+
+    await loadAssets();
+    buildWorld();
+
+    // Player starts on the path crossing
+    const player = new Character('player', 15, 11);
+    player.atkTimer = 0;
+    player.atkCooldown = 0;
+    player.atkHit = false;
+    player.hp = PLAYER_MAX_HP;
+    player.hitInvuln = 0;
+    player.knockVx = 0;
+    player.knockVy = 0;
+    player.dashTimer = 0;
+    player.dashCooldown = 0;
+    player.dashDx = 0;
+    player.dashDy = 0;
+    player.dashing = false;
+    player.afterimages = [];
+    let gameOver = false;
+
+    // NPCs scattered in the village
+    const elfMage = new NPC('elf', 13, 8, 'Welcome to our village, traveler!');
+    elfMage.ranged = true;
+    elfMage.projType = 'magic';
+    elfMage.hp = 2; // mages are frailer
+
+    const archer = new NPC('npc2', 23, 11, 'Watch out for monsters in the forest!');
+    archer.ranged = true;
+    archer.projType = 'arrow';
+
+    const npcs = [
+        elfMage,
+        new NPC('npc1',  8, 11, 'The well water is fresh today.'),
+        archer,
+        new NPC('npc3', 18, 17, 'Beautiful weather, isn\'t it?'),
+    ];
+
+    // Snap camera to player initially
+    cam.x = player.x + FW / 2 - VIEW_W / 2;
+    cam.y = player.y + FH / 2 - VIEW_H / 2;
+
+    let lastTime = performance.now();
+
+    function loop(now) {
+        const dt = Math.min((now - lastTime) / 1000, 0.05);
+        lastTime = now;
+
+        // ---- Hit freeze (hitstop) ----
+        if (freezeTimer > 0) {
+            freezeTimer -= dt;
+            // Still render during freeze, just don't update
+            renderGround();
+            drawShadow(player);
+            for (const npc of npcs) drawShadow(npc);
+            drawAfterimages(player);
+            renderScene(player, npcs);
+            drawSwordSlash(player);
+            for (const npc of npcs) { drawNpcSlash(npc); drawNpcCharge(npc); }
+            drawProjectiles();
+            drawParticles();
+            for (const npc of npcs) { drawAggroMark(npc); drawNpcHpBar(npc); }
+            drawHUD(player);
+            drawDlg();
+            requestAnimationFrame(loop);
+            return;
+        }
+
+        // ---- Game Over ----
+        if (gameOver) {
+            if (keys['KeyR']) {
+                keys['KeyR'] = false;
+                gameOver = false;
+                player.hp = PLAYER_MAX_HP;
+                player.hitInvuln = 0;
+                player.knockVx = 0;
+                player.knockVy = 0;
+                player.x = 15 * TILE;
+                player.y = 11 * TILE;
+                player.atkTimer = 0;
+                player.atkCooldown = 0;
+                player.dashTimer = 0;
+                player.dashCooldown = 0;
+                player.dashing = false;
+                player.afterimages = [];
+                projectiles.length = 0;
+                for (const npc of npcs) {
+                    npc.aggro = false;
+                    npc.alive = true;
+                    npc.hp = npc.ranged && npc.projType === 'magic' ? 2 : NPC_MAX_HP;
+                    npc.x = npc.homeX;
+                    npc.y = npc.homeY;
+                    npc.atkTimer = 0;
+                    npc.atkCooldown = 0;
+                    npc.rangedCooldown = 0;
+                    npc.fireQueued = false;
+                    npc.knockVx = 0;
+                    npc.knockVy = 0;
+                }
+            }
+            renderGround();
+            drawShadow(player);
+            for (const npc of npcs) drawShadow(npc);
+            renderScene(player, npcs);
+            drawHUD(player);
+            drawGameOver();
+            requestAnimationFrame(loop);
+            return;
+        }
+
+        // ---- Player hit reaction ----
+        if (player.hitInvuln > 0) player.hitInvuln -= dt;
+        if (Math.abs(player.knockVx) > 1 || Math.abs(player.knockVy) > 1) {
+            const bw = 20, bh = 14;
+            const nx = player.x + player.knockVx * dt;
+            const ny = player.y + player.knockVy * dt;
+            if (!blocked(nx + (FW - bw) / 2, ny + FH - bh, bw, bh)) {
+                player.x = nx;
+                player.y = ny;
+            } else {
+                player.knockVx *= -0.3;
+                player.knockVy *= -0.3;
+            }
+            player.knockVx *= 0.90;
+            player.knockVy *= 0.90;
+        }
+
+        // ---- Input ----
+        let dx = 0, dy = 0;
+        if (keys['ArrowLeft']  || keys['KeyA']) dx -= 1;
+        if (keys['ArrowRight'] || keys['KeyD']) dx += 1;
+        if (keys['ArrowUp']    || keys['KeyW']) dy -= 1;
+        if (keys['ArrowDown']  || keys['KeyS']) dy += 1;
+        if (dx && dy) { dx *= 0.707; dy *= 0.707; }
+
+        // Lock movement during knockback
+        if (Math.abs(player.knockVx) > 5 || Math.abs(player.knockVy) > 5) {
+            dx = 0; dy = 0;
+        }
+
+        // ---- Dash ----
+        if (player.dashCooldown > 0) player.dashCooldown -= dt;
+
+        // Fade afterimages
+        for (let i = player.afterimages.length - 1; i >= 0; i--) {
+            player.afterimages[i].alpha -= dt * 4;
+            if (player.afterimages[i].alpha <= 0) player.afterimages.splice(i, 1);
+        }
+
+        if (player.dashTimer > 0) {
+            // Currently dashing
+            player.dashTimer -= dt;
+            player.dashing = true;
+
+            // Move at dash speed
+            const bw = 20, bh = 14;
+            const nx = player.x + player.dashDx * DASH_SPEED;
+            const ny = player.y + player.dashDy * DASH_SPEED;
+            if (!blocked(nx + (FW - bw) / 2, ny + FH - bh, bw, bh)) {
+                player.x = nx;
+                player.y = ny;
+            }
+
+            // Spawn afterimage every other frame
+            if (Math.floor(player.dashTimer * 60) % 2 === 0) {
+                player.afterimages.push({
+                    x: player.x, y: player.y,
+                    dir: player.dir, frame: player.frame,
+                    alpha: 0.6
+                });
+            }
+
+            // Spawn dash dust
+            if (Math.random() < 0.5) {
+                spawnParticles(
+                    player.x + FW / 2 - player.dashDx * 10,
+                    player.y + FH - 4,
+                    'rgba(200,200,255,0.8)', 1
+                );
+            }
+
+            if (player.dashTimer <= 0) {
+                player.dashing = false;
+                player.dashCooldown = DASH_COOLDOWN;
+            }
+
+            player.moving = true;
+            player.update(dt);
+        } else {
+            player.dashing = false;
+
+            // Start dash
+            if ((keys['ShiftLeft'] || keys['ShiftRight']) && player.dashCooldown <= 0
+                && player.atkTimer <= 0
+                && !(Math.abs(player.knockVx) > 5 || Math.abs(player.knockVy) > 5)) {
+                keys['ShiftLeft'] = false;
+                keys['ShiftRight'] = false;
+                // Dash in movement direction, or facing direction if standing
+                let ddx = dx, ddy = dy;
+                if (ddx === 0 && ddy === 0) {
+                    ddx = DIR_DX[player.dir];
+                    ddy = DIR_DY[player.dir];
+                }
+                const len = Math.hypot(ddx, ddy);
+                if (len > 0) {
+                    player.dashDx = ddx / len;
+                    player.dashDy = ddy / len;
+                    player.dashTimer = DASH_DURATION;
+                    player.dashing = true;
+                    // Initial afterimage
+                    player.afterimages.push({
+                        x: player.x, y: player.y,
+                        dir: player.dir, frame: player.frame,
+                        alpha: 0.7
+                    });
+                    spawnParticles(player.x + FW / 2, player.y + FH - 4, '#aabbff', 5);
+                }
+                dx = 0; dy = 0;
+            }
+
+            // ---- Attack ----
+            if (keys['KeyX'] || keys['KeyJ']) {
+                keys['KeyX'] = false;
+                keys['KeyJ'] = false;
+                if (player.atkCooldown <= 0 && player.atkTimer <= 0) {
+                    player.atkTimer = ATK_DURATION;
+                    player.atkCooldown = ATK_COOLDOWN;
+                    player.atkHit = false;
+                }
+            }
+
+            // Lock movement during attack
+            if (player.atkTimer > 0) {
+                dx = 0; dy = 0;
+            }
+
+            player.moving = dx !== 0 || dy !== 0;
+            if (player.moving) player.tryMove(dx, dy);
+            player.update(dt);
+        }
+
+        // Attack update + hit detection
+        if (player.atkTimer > 0) {
+            player.atkTimer -= dt;
+
+            if (!player.atkHit && player.atkTimer < ATK_DURATION * 0.5) {
+                const aDx = DIR_DX[player.dir];
+                const aDy = DIR_DY[player.dir];
+                const hitX = player.x + FW / 2 + aDx * ATK_RANGE;
+                const hitY = player.y + FH * 0.45 + aDy * ATK_RANGE;
+
+                for (const npc of npcs) {
+                    if (npc.hitInvuln > 0) continue;
+                    const ncx = npc.x + FW / 2;
+                    const ncy = npc.y + FH / 2;
+                    if (Math.hypot(hitX - ncx, hitY - ncy) < TILE * 1.3) {
+                        npc.hitTimer = 0.3;
+                        npc.hitInvuln = 0.8;
+                        npc.hp--;
+                        npc.aggro = true;
+                        const pushA = Math.atan2(ncy - (player.y + FH / 2), ncx - (player.x + FW / 2));
+                        npc.knockVx = Math.cos(pushA) * KNOCKBACK;
+                        npc.knockVy = Math.sin(pushA) * KNOCKBACK;
+                        player.atkHit = true;
+
+                        spawnParticles(ncx, ncy, '#ffdd44', 10);
+                        spawnParticles(ncx, ncy, '#ffffff', 5);
+                        shakeTimer = 0.15;
+                        shakeIntensity = 5;
+                        freezeTimer = HIT_FREEZE;
+
+                        // Nearby NPCs also aggro
+                        for (const other of npcs) {
+                            if (other !== npc && other.alive && !other.aggro) {
+                                if (Math.hypot(other.x - npc.x, other.y - npc.y) < 5 * TILE) {
+                                    other.aggro = true;
+                                }
+                            }
+                        }
+
+                        const reactions = npc.hp > 0
+                            ? ['You\'ll pay for that!', 'En garde!', 'That\'s it!', 'You asked for it!']
+                            : ['Argh...!', 'I yield...', 'Defeated...'];
+                        showDlg(reactions[Math.floor(Math.random() * reactions.length)]);
+                        break;
+                    }
+                }
+            }
+        }
+        if (player.atkCooldown > 0) player.atkCooldown -= dt;
+
+        // ---- Interact ----
+        if (keys['Space']) {
+            keys['Space'] = false;
+            for (const npc of npcs) {
+                if (Math.hypot(npc.x - player.x, npc.y - player.y) < TILE * 2) {
+                    showDlg(npc.dialogue);
+                    // Face NPC toward player
+                    if (Math.abs(player.x - npc.x) > Math.abs(player.y - npc.y))
+                        npc.dir = player.x < npc.x ? 'left' : 'right';
+                    else
+                        npc.dir = player.y < npc.y ? 'up' : 'down';
+                    break;
+                }
+            }
+        }
+
+        // ---- Update NPCs ----
+        for (const npc of npcs) npc.update(dt, player);
+
+        // ---- Projectiles ----
+        if (updateProjectiles(dt, player, npcs)) {
+            gameOver = true;
+            showDlg('');
+        }
+
+        // ---- NPC attacks hit player ----
+        if (player.hitInvuln <= 0 && !player.dashing) {
+            for (const npc of npcs) {
+                if (!npc.alive || !npc.aggro || npc.atkTimer <= 0) continue;
+                if (npc.atkTimer < NPC_ATK_DURATION * 0.4 && !npc.atkHit) {
+                    const aDx = DIR_DX[npc.dir];
+                    const aDy = DIR_DY[npc.dir];
+                    const hx = npc.x + FW / 2 + aDx * NPC_ATK_RANGE;
+                    const hy = npc.y + FH * 0.45 + aDy * NPC_ATK_RANGE;
+                    const pcx = player.x + FW / 2;
+                    const pcy = player.y + FH / 2;
+                    if (Math.hypot(hx - pcx, hy - pcy) < TILE * 1.3) {
+                        npc.atkHit = true;
+                        player.hp--;
+                        player.hitInvuln = 1.0;
+                        const pushA = Math.atan2(pcy - (npc.y + FH / 2), pcx - (npc.x + FW / 2));
+                        player.knockVx = Math.cos(pushA) * KNOCKBACK * 0.8;
+                        player.knockVy = Math.sin(pushA) * KNOCKBACK * 0.8;
+                        spawnParticles(pcx, pcy, '#ff4444', 10);
+                        spawnParticles(pcx, pcy, '#ffffff', 5);
+                        shakeTimer = 0.18;
+                        shakeIntensity = 6;
+                        freezeTimer = HIT_FREEZE;
+                        if (player.hp <= 0) {
+                            gameOver = true;
+                            showDlg('');
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- Camera ----
+        updateCam(player);
+
+        // ---- Dialogue timer ----
+        if (dlgTimer > 0) dlgTimer -= dt;
+
+        // ---- Particles ----
+        updateParticles(dt);
+
+        // ---- Screen shake ----
+        const savedCX = cam.x, savedCY = cam.y;
+        if (shakeTimer > 0) {
+            shakeTimer -= dt;
+            cam.x += (Math.random() - 0.5) * shakeIntensity * 2;
+            cam.y += (Math.random() - 0.5) * shakeIntensity * 2;
+        }
+
+        // ---- Render ----
+        renderGround();
+
+        // Draw shadows under all characters
+        drawShadow(player);
+        for (const npc of npcs) drawShadow(npc);
+
+        drawAfterimages(player);
+        renderScene(player, npcs);
+        drawSwordSlash(player);
+        for (const npc of npcs) { drawNpcSlash(npc); drawNpcCharge(npc); }
+        drawProjectiles();
+        drawParticles();
+        for (const npc of npcs) { drawAggroMark(npc); drawNpcHpBar(npc); }
+        drawHUD(player);
+        drawDlg();
+
+        // Restore camera after shake
+        cam.x = savedCX;
+        cam.y = savedCY;
+
+        requestAnimationFrame(loop);
+    }
+
+    requestAnimationFrame(loop);
+}
+
+main();
+</script>
+</body>
+</html>
