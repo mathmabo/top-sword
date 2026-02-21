@@ -29,7 +29,7 @@ canvas {
 </head>
 <body>
 <canvas id="game"></canvas>
-<div id="controls">WASD / Arrow Keys: Move &nbsp;&bull;&nbsp; X / J: Attack &nbsp;&bull;&nbsp; Shift: Dash &nbsp;&bull;&nbsp; Space: Interact &nbsp;&bull;&nbsp; R: Restart</div>
+<div id="controls">WASD / Arrow Keys: Move &nbsp;&bull;&nbsp; Left Click: Attack &nbsp;&bull;&nbsp; Shift: Dash &nbsp;&bull;&nbsp; Space: Interact &nbsp;&bull;&nbsp; R: Restart</div>
 <script>
 // ============================================================
 //  CONSTANTS
@@ -49,6 +49,12 @@ const ATK_RANGE    = 42;            // sword reach in px
 const KNOCKBACK    = 550;           // knockback speed on hit
 const HIT_FREEZE   = 0.07;          // brief freeze-frame on hit
 const SWEEP_ANGLE  = Math.PI * 0.75;
+const COMBO_WINDOW = 0.4;  // seconds to chain next hit
+const COMBO_STEPS = [
+    { dir: 1,  durMul: 1.0,  cdMul: 0.15, dmg: 1, knockMul: 1.0, arc: 0.75 },  // normal sweep
+    { dir: -1, durMul: 0.85, cdMul: 0.15, dmg: 1, knockMul: 1.0, arc: 0.75 },  // reverse sweep
+    { dir: 1,  durMul: 1.2,  cdMul: 1.0,  dmg: 2, knockMul: 1.5, arc: 1.0  },  // heavy finisher
+];
 const DIR_ANGLE = { down: Math.PI*0.5, up: -Math.PI*0.5, left: Math.PI, right: 0 };
 const NPC_ATK_DURATION = 0.35;
 const NPC_ATK_COOLDOWN = 1.2;
@@ -61,12 +67,18 @@ const PROJ_SPEED_MAGIC = 170;
 const PROJ_SPEED_ARROW = 260;
 const RANGED_WINDUP    = 0.4;
 const RANGED_FIRE_AT   = 0.15;        // fire when atkTimer falls to this
+const ORB_DROP_CHANCE  = 0.4;         // 40% chance to drop a health orb
+const ORB_HEAL         = 1;           // HP restored per orb
+const ORB_LIFETIME     = 10;          // seconds before orb disappears
+const ORB_RADIUS       = 8;           // pickup / draw radius
 const RANGED_COOLDOWN  = 1.8;
 const RANGED_DIST_MIN  = 3 * TILE;    // retreat if closer
 const RANGED_DIST_IDEAL= 6 * TILE;    // approach if farther
 const DASH_SPEED       = 9;
 const DASH_DURATION    = 0.12;
 const DASH_COOLDOWN    = 0.5;
+const XP_BASE          = 3;
+const XP_PER_LEVEL     = 2;
 
 // Spritesheet row order (per character_tilesheet.md)
 const DIR_ROW = { down: 0, left: 1, right: 2, up: 3 };
@@ -365,6 +377,7 @@ class NPC extends Character {
             this.aggro = false;
             spawnParticles(this.x + FW / 2, this.y + FH / 2, '#ff6644', 15);
             spawnParticles(this.x + FW / 2, this.y + FH / 2, '#ffcc00', 10);
+            spawnHealthOrb(this.x + FW / 2, this.y + FH / 2);
             return;
         }
 
@@ -500,15 +513,83 @@ class NPC extends Character {
 }
 
 // ============================================================
+//  AUDIO
+// ============================================================
+let audioCtx;
+function getAudioCtx() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    return audioCtx;
+}
+
+function playHealSound() {
+    const ac = getAudioCtx();
+    const now = ac.currentTime;
+
+    // Two-tone ascending chime
+    [523.25, 659.25].forEach((freq, i) => {
+        const osc = ac.createOscillator();
+        const gain = ac.createGain();
+        osc.type = 'sine';
+        osc.frequency.value = freq;
+        gain.gain.setValueAtTime(0, now + i * 0.08);
+        gain.gain.linearRampToValueAtTime(0.18, now + i * 0.08 + 0.03);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + i * 0.08 + 0.3);
+        osc.connect(gain).connect(ac.destination);
+        osc.start(now + i * 0.08);
+        osc.stop(now + i * 0.08 + 0.3);
+    });
+}
+
+function playLevelUpSound() {
+    const ac = getAudioCtx();
+    const now = ac.currentTime;
+    // Three-note ascending fanfare C5->E5->G5
+    [523.25, 659.25, 783.99].forEach((freq, i) => {
+        const osc = ac.createOscillator();
+        const gain = ac.createGain();
+        osc.type = 'triangle';
+        osc.frequency.value = freq;
+        gain.gain.setValueAtTime(0, now + i * 0.1);
+        gain.gain.linearRampToValueAtTime(0.22, now + i * 0.1 + 0.03);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + i * 0.1 + 0.4);
+        osc.connect(gain).connect(ac.destination);
+        osc.start(now + i * 0.1);
+        osc.stop(now + i * 0.1 + 0.4);
+    });
+    // Shimmering G6 sustain
+    const osc2 = ac.createOscillator();
+    const gain2 = ac.createGain();
+    osc2.type = 'sine';
+    osc2.frequency.value = 1567.98;
+    gain2.gain.setValueAtTime(0, now + 0.15);
+    gain2.gain.linearRampToValueAtTime(0.1, now + 0.25);
+    gain2.gain.exponentialRampToValueAtTime(0.001, now + 0.8);
+    osc2.connect(gain2).connect(ac.destination);
+    osc2.start(now + 0.15);
+    osc2.stop(now + 0.8);
+}
+
+// ============================================================
 //  INPUT
 // ============================================================
 const keys = {};
 window.addEventListener('keydown', e => {
     keys[e.code] = true;
-    if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space','KeyX','KeyJ','ShiftLeft','ShiftRight'].includes(e.code))
+    if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space','ShiftLeft','ShiftRight'].includes(e.code))
         e.preventDefault();
 });
 window.addEventListener('keyup', e => { keys[e.code] = false; });
+window.addEventListener('mousedown', e => { if (e.button === 0) keys['Mouse0'] = true; });
+window.addEventListener('mouseup', e => { if (e.button === 0) keys['Mouse0'] = false; });
+
+let mouseX = 0, mouseY = 0;
+let mouseClicked = false;
+canvas.addEventListener('mousemove', e => {
+    const rect = canvas.getBoundingClientRect();
+    mouseX = (e.clientX - rect.left) * (VIEW_W / rect.width);
+    mouseY = (e.clientY - rect.top) * (VIEW_H / rect.height);
+});
+canvas.addEventListener('click', () => { mouseClicked = true; });
 
 // ============================================================
 //  CAMERA
@@ -691,6 +772,77 @@ function drawParticles() {
 }
 
 // ============================================================
+//  HEALTH ORBS
+// ============================================================
+const healthOrbs = [];
+
+function spawnHealthOrb(wx, wy) {
+    if (Math.random() > ORB_DROP_CHANCE) return;
+    healthOrbs.push({
+        x: wx, y: wy,
+        life: ORB_LIFETIME,
+        bobPhase: Math.random() * Math.PI * 2
+    });
+}
+
+function updateHealthOrbs(dt, player) {
+    for (let i = healthOrbs.length - 1; i >= 0; i--) {
+        const orb = healthOrbs[i];
+        orb.life -= dt;
+        orb.bobPhase += dt * 3;
+        if (orb.life <= 0) { healthOrbs.splice(i, 1); continue; }
+
+        // Pickup check
+        const dx = (player.x + FW / 2) - orb.x;
+        const dy = (player.y + FH / 2) - orb.y;
+        if (Math.hypot(dx, dy) < TILE * 0.8) {
+            if (player.hp < player.stats.maxHp) {
+                player.hp = Math.min(player.hp + ORB_HEAL + player.stats.orbHealBonus, player.stats.maxHp);
+                spawnParticles(orb.x, orb.y, '#44ff66', 10);
+                spawnParticles(orb.x, orb.y, '#ffffff', 5);
+                playHealSound();
+                healthOrbs.splice(i, 1);
+            }
+        }
+    }
+}
+
+function drawHealthOrbs() {
+    for (const orb of healthOrbs) {
+        const sx = Math.round(orb.x - cam.x);
+        const sy = Math.round(orb.y - cam.y + Math.sin(orb.bobPhase) * 4);
+        const fade = orb.life < 2 ? orb.life / 2 : 1;
+
+        // Outer glow
+        ctx.globalAlpha = 0.25 * fade;
+        ctx.fillStyle = '#44ff66';
+        ctx.beginPath();
+        ctx.arc(sx, sy, ORB_RADIUS * 2, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Core orb
+        ctx.globalAlpha = 0.9 * fade;
+        const grad = ctx.createRadialGradient(sx, sy, 0, sx, sy, ORB_RADIUS);
+        grad.addColorStop(0, '#ffffff');
+        grad.addColorStop(0.4, '#66ff88');
+        grad.addColorStop(1, '#22aa44');
+        ctx.fillStyle = grad;
+        ctx.beginPath();
+        ctx.arc(sx, sy, ORB_RADIUS, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Highlight
+        ctx.globalAlpha = 0.7 * fade;
+        ctx.fillStyle = '#ffffff';
+        ctx.beginPath();
+        ctx.arc(sx - 2, sy - 2, 3, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.globalAlpha = 1;
+    }
+}
+
+// ============================================================
 //  SCREEN SHAKE
 // ============================================================
 let shakeTimer = 0;
@@ -700,42 +852,53 @@ let freezeTimer = 0;
 // ============================================================
 //  SWORD SLASH EFFECT
 // ============================================================
+const SLASH_COLORS = [
+    { outer: [255,220,80],  main: [255,250,220], inner: [255,255,255] },  // gold
+    { outer: [140,200,255], main: [200,230,255], inner: [255,255,255] },  // ice-blue
+    { outer: [255,120,40],  main: [255,180,80],  inner: [255,255,200] },  // fire-orange
+];
+
 function drawSwordSlash(player) {
     if (!player.atkTimer || player.atkTimer <= 0) return;
 
-    const progress = 1 - (player.atkTimer / ATK_DURATION);
+    const step = COMBO_STEPS[player.comboStep];
+    const stepDur = player.stats.atkDuration * step.durMul;
+    const progress = 1 - (player.atkTimer / stepDur);
     const cx = Math.round(player.x + FW / 2 - cam.x);
     const cy = Math.round(player.y + FH * 0.45 - cam.y);
     const base = DIR_ANGLE[player.dir];
-    const start = base - SWEEP_ANGLE / 2;
-    const current = start + progress * SWEEP_ANGLE;
+    const sweepArc = SWEEP_ANGLE * (step.arc / 0.75);
+    const start = base + (step.dir === -1 ? sweepArc / 2 : -sweepArc / 2);
+    const current = start + step.dir * progress * sweepArc;
     const fade = 1 - progress;
+    const range = player.stats.atkRange;
+    const col = SLASH_COLORS[player.comboStep];
 
     ctx.save();
 
     // Outer glow arc
-    ctx.strokeStyle = `rgba(255, 220, 80, ${0.25 * fade})`;
-    ctx.lineWidth = 14;
+    ctx.strokeStyle = `rgba(${col.outer[0]}, ${col.outer[1]}, ${col.outer[2]}, ${0.25 * fade})`;
+    ctx.lineWidth = player.comboStep === 2 ? 18 : 14;
     ctx.beginPath();
-    ctx.arc(cx, cy, ATK_RANGE, start, current);
+    ctx.arc(cx, cy, range, Math.min(start, current), Math.max(start, current));
     ctx.stroke();
 
     // Main slash arc
-    ctx.strokeStyle = `rgba(255, 250, 220, ${0.7 * fade})`;
-    ctx.lineWidth = 4;
+    ctx.strokeStyle = `rgba(${col.main[0]}, ${col.main[1]}, ${col.main[2]}, ${0.7 * fade})`;
+    ctx.lineWidth = player.comboStep === 2 ? 5 : 4;
     ctx.beginPath();
-    ctx.arc(cx, cy, ATK_RANGE, start, current);
+    ctx.arc(cx, cy, range, Math.min(start, current), Math.max(start, current));
     ctx.stroke();
 
     // Inner bright arc (thinner, brighter)
-    ctx.strokeStyle = `rgba(255, 255, 255, ${0.9 * fade})`;
+    ctx.strokeStyle = `rgba(${col.inner[0]}, ${col.inner[1]}, ${col.inner[2]}, ${0.9 * fade})`;
     ctx.lineWidth = 2;
     ctx.beginPath();
-    ctx.arc(cx, cy, ATK_RANGE - 3, current - 0.3, current);
+    ctx.arc(cx, cy, range - 3, current - step.dir * 0.3, current);
     ctx.stroke();
 
     // Sword blade
-    const bladeEnd = ATK_RANGE + 6;
+    const bladeEnd = range + 6;
     const ex = cx + Math.cos(current) * bladeEnd;
     const ey = cy + Math.sin(current) * bladeEnd;
     const hx = cx + Math.cos(current) * 12;
@@ -768,10 +931,23 @@ function drawSwordSlash(player) {
     ctx.stroke();
 
     // Tip sparkle
-    ctx.fillStyle = `rgba(255, 255, 240, ${fade})`;
+    ctx.fillStyle = `rgba(${col.inner[0]}, ${col.inner[1]}, ${col.inner[2]}, ${fade})`;
     ctx.beginPath();
-    ctx.arc(ex, ey, 3 * fade, 0, Math.PI * 2);
+    ctx.arc(ex, ey, player.comboStep === 2 ? 5 * fade : 3 * fade, 0, Math.PI * 2);
     ctx.fill();
+
+    // Finisher: extra tip sparks
+    if (player.comboStep === 2 && progress > 0.2 && progress < 0.8) {
+        for (let i = 0; i < 3; i++) {
+            const sparkOff = (Math.random() - 0.5) * 10;
+            const sx = ex + sparkOff;
+            const sy = ey + (Math.random() - 0.5) * 10;
+            ctx.fillStyle = `rgba(255, ${100 + Math.random() * 80 | 0}, 40, ${0.8 * fade})`;
+            ctx.beginPath();
+            ctx.arc(sx, sy, 1.5 + Math.random() * 2, 0, Math.PI * 2);
+            ctx.fill();
+        }
+    }
 
     ctx.restore();
 }
@@ -799,7 +975,7 @@ function fireProjectile(npc, targetX, targetY, type) {
     spawnParticles(sx, sy, type === 'magic' ? '#aa44ff' : '#cc8833', 6);
 }
 
-function updateProjectiles(dt, player, npcs) {
+function updateProjectiles(dt, player, npcs, onNpcKill) {
     let killedPlayer = false;
     for (let i = projectiles.length - 1; i >= 0; i--) {
         const p = projectiles[i];
@@ -819,7 +995,7 @@ function updateProjectiles(dt, player, npcs) {
         if (!p.deflected && player.atkTimer > 0) {
             const pcx = player.x + FW / 2;
             const pcy = player.y + FH * 0.45;
-            if (Math.hypot(p.x - pcx, p.y - pcy) < ATK_RANGE + p.radius + 4) {
+            if (Math.hypot(p.x - pcx, p.y - pcy) < player.stats.atkRange + p.radius + 4) {
                 const a = Math.atan2(p.y - pcy, p.x - pcx);
                 const spd = Math.hypot(p.vx, p.vy) * 1.6;
                 p.vx = Math.cos(a) * spd;
@@ -864,6 +1040,7 @@ function updateProjectiles(dt, player, npcs) {
                 const ncy = npc.y + FH / 2;
                 if (Math.hypot(p.x - ncx, p.y - ncy) < p.radius + 18) {
                     npc.hp--;
+                    if (npc.hp <= 0 && onNpcKill) onNpcKill(npc);
                     npc.hitTimer = 0.3;
                     npc.hitInvuln = 0.8;
                     npc.aggro = true;
@@ -1136,7 +1313,7 @@ function drawHUD(p) {
     // HP hearts
     const hx = 12, hy = 48;
     ctx.font = '18px serif';
-    for (let i = 0; i < PLAYER_MAX_HP; i++) {
+    for (let i = 0; i < p.stats.maxHp; i++) {
         ctx.fillStyle = i < p.hp ? '#ee3344' : '#442222';
         ctx.fillText('\u2665', hx + i * 22, hy + 16);
     }
@@ -1152,7 +1329,7 @@ function drawHUD(p) {
         ctx.fillText('DASH', dashX, dashY);
         // Cooldown bar
         const barW = 40, barH = 4;
-        const fill = 1 - (p.dashCooldown / DASH_COOLDOWN);
+        const fill = 1 - (p.dashCooldown / p.stats.dashCooldown);
         ctx.fillStyle = '#333333';
         ctx.fillRect(dashX + 46, dashY - 8, barW, barH);
         ctx.fillStyle = '#6688aa';
@@ -1164,6 +1341,165 @@ function drawHUD(p) {
         ctx.font = '10px "Courier New", monospace';
         ctx.fillText('READY', dashX + 46, dashY);
     }
+
+    // Level badge
+    ctx.fillStyle = '#c8a86e';
+    ctx.font = 'bold 12px "Courier New", monospace';
+    ctx.fillText('LV ' + p.level, 12, 96);
+
+    // XP bar
+    const xpNeeded = xpToNextLevel(p.level);
+    const xpRatio = p.xp / xpNeeded;
+    const xpBarX = 58, xpBarY = 88, xpBarW = 60, xpBarH = 6;
+    ctx.fillStyle = '#333';
+    ctx.fillRect(xpBarX, xpBarY, xpBarW, xpBarH);
+    ctx.fillStyle = '#c8a86e';
+    ctx.fillRect(xpBarX, xpBarY, xpBarW * xpRatio, xpBarH);
+    ctx.strokeStyle = '#555';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(xpBarX, xpBarY, xpBarW, xpBarH);
+    ctx.fillStyle = '#b0a898';
+    ctx.font = '10px "Courier New", monospace';
+    ctx.fillText(p.xp + '/' + xpNeeded, xpBarX + xpBarW + 6, 96);
+
+    // Combo indicator (3 small slash marks)
+    const comboProgress = p.comboStep + (p.atkTimer > 0 ? 1 : 0);
+    const comboColors = ['#c8a86e', '#88bbff', '#ff8844'];
+    for (let i = 0; i < 3; i++) {
+        if (i < comboProgress) {
+            ctx.fillStyle = comboColors[i];
+        } else if (i === comboProgress && p.comboWindow > 0) {
+            // Blink the next mark during combo window
+            ctx.fillStyle = Math.sin(performance.now() * 0.015) > 0 ? comboColors[i] : '#555';
+        } else {
+            ctx.fillStyle = '#333';
+        }
+        ctx.fillRect(12 + i * 10, 102, 6, 3);
+    }
+}
+
+// ============================================================
+//  LEVEL / XP SYSTEM
+// ============================================================
+function xpToNextLevel(level) { return XP_BASE + level * XP_PER_LEVEL; }
+
+const POWER_UPS = [
+    { name: 'Swift Blade', icon: '\u2694', desc: 'Faster attack speed', unique: false,
+      apply(s) { s.atkCooldown = Math.max(0.15, s.atkCooldown - 0.08); } },
+    { name: 'Long Reach', icon: '\uD83D\uDDE1', desc: 'Longer sword reach', unique: false,
+      apply(s) { s.atkRange += 10; } },
+    { name: 'Iron Heart', icon: '\u2665', desc: '+1 max HP, full heal', unique: false,
+      apply(s, p) { s.maxHp += 1; p.hp = s.maxHp; } },
+    { name: 'Fleet Foot', icon: '\uD83C\uDFC3', desc: 'Move faster', unique: false,
+      apply(s) { s.walkSpeed += 0.5; } },
+    { name: 'Phantom Dash', icon: '\uD83D\uDC7B', desc: 'Longer, quicker dash', unique: false,
+      apply(s) { s.dashDuration += 0.04; s.dashCooldown = Math.max(0.15, s.dashCooldown - 0.1); } },
+    { name: 'Heavy Blow', icon: '\uD83D\uDCA5', desc: 'Stronger knockback', unique: false,
+      apply(s) { s.knockback += 100; } },
+    { name: 'Vampiric Blade', icon: '\uD83E\uDE78', desc: 'Heal 1 HP on kill', unique: true,
+      apply(s) { s.lifeSteal = true; } },
+    { name: 'Healing Aura', icon: '\u2728', desc: 'Health orbs heal +1', unique: false,
+      apply(s) { s.orbHealBonus += 1; } },
+];
+
+function pickPowerUps(stats, count) {
+    const pool = POWER_UPS.filter(p => !(p.unique && stats.lifeSteal));
+    const picks = [];
+    const used = new Set();
+    while (picks.length < count && picks.length < pool.length) {
+        const idx = Math.floor(Math.random() * pool.length);
+        if (!used.has(idx)) { used.add(idx); picks.push(pool[idx]); }
+    }
+    return picks;
+}
+
+function drawLevelUpOverlay(choices, hoverIdx) {
+    // Dim overlay
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+
+    // Title
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#c8a86e';
+    ctx.font = 'bold 28px "Courier New", monospace';
+    ctx.fillText('LEVEL UP!', VIEW_W / 2, VIEW_H / 2 - 130);
+
+    // Cards
+    const cardW = 170, cardH = 180, gap = 16;
+    const totalW = choices.length * cardW + (choices.length - 1) * gap;
+    const startX = (VIEW_W - totalW) / 2;
+    const cardY = VIEW_H / 2 - 80;
+
+    for (let i = 0; i < choices.length; i++) {
+        const pu = choices[i];
+        const cx = startX + i * (cardW + gap);
+        const hover = i === hoverIdx;
+
+        // Card bg
+        ctx.fillStyle = hover ? 'rgba(40,30,20,0.95)' : 'rgba(30,20,14,0.92)';
+        ctx.strokeStyle = hover ? '#ffe090' : '#c8a86e';
+        ctx.lineWidth = hover ? 3 : 2;
+        ctx.beginPath();
+        ctx.roundRect(cx, cardY, cardW, cardH, 8);
+        ctx.fill();
+        ctx.stroke();
+
+        // Icon
+        ctx.font = '32px serif';
+        ctx.fillStyle = '#fff';
+        ctx.textAlign = 'center';
+        ctx.fillText(pu.icon, cx + cardW / 2, cardY + 44);
+
+        // Name
+        ctx.font = 'bold 13px "Courier New", monospace';
+        ctx.fillStyle = '#c8a86e';
+        ctx.fillText(pu.name, cx + cardW / 2, cardY + 80);
+
+        // Description (word wrap)
+        ctx.font = '11px "Courier New", monospace';
+        ctx.fillStyle = '#b0a898';
+        const words = pu.desc.split(' ');
+        let line = '', ly = cardY + 104;
+        for (const word of words) {
+            const test = line ? line + ' ' + word : word;
+            if (ctx.measureText(test).width > cardW - 20) {
+                ctx.fillText(line, cx + cardW / 2, ly);
+                line = word;
+                ly += 14;
+            } else {
+                line = test;
+            }
+        }
+        if (line) ctx.fillText(line, cx + cardW / 2, ly);
+
+        // Number hint
+        ctx.font = 'bold 14px "Courier New", monospace';
+        ctx.fillStyle = hover ? '#ffe090' : '#887766';
+        ctx.fillText((i + 1).toString(), cx + cardW / 2, cardY + cardH - 14);
+    }
+
+    // Instruction
+    ctx.font = '12px "Courier New", monospace';
+    ctx.fillStyle = '#887766';
+    ctx.fillText('Press 1, 2, 3 or click to choose', VIEW_W / 2, cardY + cardH + 30);
+
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+}
+
+function getLevelUpHoverIdx(choices) {
+    const cardW = 170, cardH = 180, gap = 16;
+    const totalW = choices.length * cardW + (choices.length - 1) * gap;
+    const startX = (VIEW_W - totalW) / 2;
+    const cardY = VIEW_H / 2 - 80;
+    for (let i = 0; i < choices.length; i++) {
+        const cx = startX + i * (cardW + gap);
+        if (mouseX >= cx && mouseX <= cx + cardW && mouseY >= cardY && mouseY <= cardY + cardH) {
+            return i;
+        }
+    }
+    return -1;
 }
 
 // ============================================================
@@ -1197,6 +1533,39 @@ async function main() {
     player.dashDy = 0;
     player.dashing = false;
     player.afterimages = [];
+    player.xp = 0;
+    player.level = 1;
+    player.stats = {
+        walkSpeed: WALK_SPEED,
+        atkDuration: ATK_DURATION,
+        atkCooldown: ATK_COOLDOWN,
+        atkRange: ATK_RANGE,
+        knockback: KNOCKBACK,
+        dashSpeed: DASH_SPEED,
+        dashDuration: DASH_DURATION,
+        dashCooldown: DASH_COOLDOWN,
+        maxHp: PLAYER_MAX_HP,
+        orbHealBonus: 0,
+        lifeSteal: false,
+        comboDmgBonus: 0,
+    };
+    player.comboStep = 0;
+    player.comboWindow = 0;
+    let levelUpActive = false;
+    let levelUpChoices = [];
+
+    function addXp(amount) {
+        player.xp += amount;
+        const needed = xpToNextLevel(player.level);
+        if (player.xp >= needed) {
+            player.xp -= needed;
+            player.level++;
+            levelUpActive = true;
+            levelUpChoices = pickPowerUps(player.stats, 3);
+            playLevelUpSound();
+        }
+    }
+
     let gameOver = false;
 
     // NPCs scattered in the village
@@ -1239,9 +1608,51 @@ async function main() {
             for (const npc of npcs) { drawNpcSlash(npc); drawNpcCharge(npc); }
             drawProjectiles();
             drawParticles();
+            drawHealthOrbs();
             for (const npc of npcs) { drawAggroMark(npc); drawNpcHpBar(npc); }
             drawHUD(player);
             drawDlg();
+            requestAnimationFrame(loop);
+            return;
+        }
+
+        // ---- Level Up overlay ----
+        if (levelUpActive) {
+            renderGround();
+            drawShadow(player);
+            for (const npc of npcs) drawShadow(npc);
+            drawAfterimages(player);
+            renderScene(player, npcs);
+            drawSwordSlash(player);
+            for (const npc of npcs) { drawNpcSlash(npc); drawNpcCharge(npc); }
+            drawProjectiles();
+            drawParticles();
+            drawHealthOrbs();
+            for (const npc of npcs) { drawAggroMark(npc); drawNpcHpBar(npc); }
+            drawHUD(player);
+            drawDlg();
+
+            const hoverIdx = getLevelUpHoverIdx(levelUpChoices);
+            drawLevelUpOverlay(levelUpChoices, hoverIdx);
+
+            // Keyboard selection
+            let sel = -1;
+            if (keys['Digit1']) { sel = 0; keys['Digit1'] = false; }
+            if (keys['Digit2']) { sel = 1; keys['Digit2'] = false; }
+            if (keys['Digit3']) { sel = 2; keys['Digit3'] = false; }
+            // Mouse click selection
+            if (mouseClicked && hoverIdx >= 0) { sel = hoverIdx; }
+            mouseClicked = false;
+
+            if (sel >= 0 && sel < levelUpChoices.length) {
+                const pu = levelUpChoices[sel];
+                pu.apply(player.stats, player);
+                levelUpActive = false;
+                spawnParticles(player.x + FW / 2, player.y + FH / 2, '#ffee44', 20);
+                spawnParticles(player.x + FW / 2, player.y + FH / 2, '#ffffff', 10);
+                showDlg(pu.name + ' acquired!');
+            }
+
             requestAnimationFrame(loop);
             return;
         }
@@ -1251,7 +1662,25 @@ async function main() {
             if (keys['KeyR']) {
                 keys['KeyR'] = false;
                 gameOver = false;
-                player.hp = PLAYER_MAX_HP;
+                player.xp = 0;
+                player.level = 1;
+                player.stats = {
+                    walkSpeed: WALK_SPEED,
+                    atkDuration: ATK_DURATION,
+                    atkCooldown: ATK_COOLDOWN,
+                    atkRange: ATK_RANGE,
+                    knockback: KNOCKBACK,
+                    dashSpeed: DASH_SPEED,
+                    dashDuration: DASH_DURATION,
+                    dashCooldown: DASH_COOLDOWN,
+                    maxHp: PLAYER_MAX_HP,
+                    orbHealBonus: 0,
+                    lifeSteal: false,
+                    comboDmgBonus: 0,
+                };
+                levelUpActive = false;
+                levelUpChoices = [];
+                player.hp = player.stats.maxHp;
                 player.hitInvuln = 0;
                 player.knockVx = 0;
                 player.knockVy = 0;
@@ -1259,11 +1688,14 @@ async function main() {
                 player.y = 11 * TILE;
                 player.atkTimer = 0;
                 player.atkCooldown = 0;
+                player.comboStep = 0;
+                player.comboWindow = 0;
                 player.dashTimer = 0;
                 player.dashCooldown = 0;
                 player.dashing = false;
                 player.afterimages = [];
                 projectiles.length = 0;
+                healthOrbs.length = 0;
                 for (const npc of npcs) {
                     npc.aggro = false;
                     npc.alive = true;
@@ -1287,6 +1719,8 @@ async function main() {
             requestAnimationFrame(loop);
             return;
         }
+
+        mouseClicked = false; // consume stale clicks outside level-up
 
         // ---- Player hit reaction ----
         if (player.hitInvuln > 0) player.hitInvuln -= dt;
@@ -1334,8 +1768,8 @@ async function main() {
 
             // Move at dash speed
             const bw = 20, bh = 14;
-            const nx = player.x + player.dashDx * DASH_SPEED;
-            const ny = player.y + player.dashDy * DASH_SPEED;
+            const nx = player.x + player.dashDx * player.stats.dashSpeed;
+            const ny = player.y + player.dashDy * player.stats.dashSpeed;
             if (!blocked(nx + (FW - bw) / 2, ny + FH - bh, bw, bh)) {
                 player.x = nx;
                 player.y = ny;
@@ -1361,7 +1795,7 @@ async function main() {
 
             if (player.dashTimer <= 0) {
                 player.dashing = false;
-                player.dashCooldown = DASH_COOLDOWN;
+                player.dashCooldown = player.stats.dashCooldown;
             }
 
             player.moving = true;
@@ -1385,7 +1819,7 @@ async function main() {
                 if (len > 0) {
                     player.dashDx = ddx / len;
                     player.dashDy = ddy / len;
-                    player.dashTimer = DASH_DURATION;
+                    player.dashTimer = player.stats.dashDuration;
                     player.dashing = true;
                     // Initial afterimage
                     player.afterimages.push({
@@ -1398,14 +1832,20 @@ async function main() {
                 dx = 0; dy = 0;
             }
 
-            // ---- Attack ----
-            if (keys['KeyX'] || keys['KeyJ']) {
-                keys['KeyX'] = false;
-                keys['KeyJ'] = false;
+            // ---- Attack (Combo Chain) ----
+            if (keys['Mouse0']) {
+                keys['Mouse0'] = false;
                 if (player.atkCooldown <= 0 && player.atkTimer <= 0) {
-                    player.atkTimer = ATK_DURATION;
-                    player.atkCooldown = ATK_COOLDOWN;
+                    if (player.comboWindow > 0 && player.comboStep < 2) {
+                        player.comboStep++;
+                    } else {
+                        player.comboStep = 0;
+                    }
+                    const step = COMBO_STEPS[player.comboStep];
+                    player.atkTimer = player.stats.atkDuration * step.durMul;
+                    player.atkCooldown = player.stats.atkCooldown * step.cdMul;
                     player.atkHit = false;
+                    player.comboWindow = 0;
                 }
             }
 
@@ -1414,6 +1854,7 @@ async function main() {
                 dx = 0; dy = 0;
             }
 
+            player.speed = player.stats.walkSpeed;
             player.moving = dx !== 0 || dy !== 0;
             if (player.moving) player.tryMove(dx, dy);
             player.update(dt);
@@ -1421,53 +1862,90 @@ async function main() {
 
         // Attack update + hit detection
         if (player.atkTimer > 0) {
+            const prevTimer = player.atkTimer;
             player.atkTimer -= dt;
 
-            if (!player.atkHit && player.atkTimer < ATK_DURATION * 0.5) {
-                const aDx = DIR_DX[player.dir];
-                const aDy = DIR_DY[player.dir];
-                const hitX = player.x + FW / 2 + aDx * ATK_RANGE;
-                const hitY = player.y + FH * 0.45 + aDy * ATK_RANGE;
+            const step = COMBO_STEPS[player.comboStep];
+            const stepDur = player.stats.atkDuration * step.durMul;
+            const isFinisher = player.comboStep === 2;
 
-                for (const npc of npcs) {
-                    if (npc.hitInvuln > 0) continue;
-                    const ncx = npc.x + FW / 2;
-                    const ncy = npc.y + FH / 2;
-                    if (Math.hypot(hitX - ncx, hitY - ncy) < TILE * 1.3) {
-                        npc.hitTimer = 0.3;
-                        npc.hitInvuln = 0.8;
-                        npc.hp--;
-                        npc.aggro = true;
-                        const pushA = Math.atan2(ncy - (player.y + FH / 2), ncx - (player.x + FW / 2));
-                        npc.knockVx = Math.cos(pushA) * KNOCKBACK;
-                        npc.knockVy = Math.sin(pushA) * KNOCKBACK;
-                        player.atkHit = true;
+            // Hit detection (at halfway through the swing)
+            if (player.atkTimer < stepDur * 0.5) {
+                // Finisher can multi-hit, others are single-hit
+                if (!player.atkHit || isFinisher) {
+                    const aDx = DIR_DX[player.dir];
+                    const aDy = DIR_DY[player.dir];
+                    const hitX = player.x + FW / 2 + aDx * player.stats.atkRange;
+                    const hitY = player.y + FH * 0.45 + aDy * player.stats.atkRange;
+                    const hitRadius = isFinisher ? TILE * 1.6 : TILE * 1.3;
 
-                        spawnParticles(ncx, ncy, '#ffdd44', 10);
-                        spawnParticles(ncx, ncy, '#ffffff', 5);
-                        shakeTimer = 0.15;
-                        shakeIntensity = 5;
-                        freezeTimer = HIT_FREEZE;
-
-                        // Nearby NPCs also aggro
-                        for (const other of npcs) {
-                            if (other !== npc && other.alive && !other.aggro) {
-                                if (Math.hypot(other.x - npc.x, other.y - npc.y) < 5 * TILE) {
-                                    other.aggro = true;
+                    for (const npc of npcs) {
+                        if (npc.hitInvuln > 0) continue;
+                        const ncx = npc.x + FW / 2;
+                        const ncy = npc.y + FH / 2;
+                        if (Math.hypot(hitX - ncx, hitY - ncy) < hitRadius) {
+                            npc.hitTimer = 0.3;
+                            npc.hitInvuln = 0.8;
+                            npc.hp -= step.dmg;
+                            npc.aggro = true;
+                            if (npc.hp <= 0) {
+                                const xpAmt = npc.ranged && npc.projType === 'magic' ? 3 : 2;
+                                addXp(xpAmt);
+                                if (player.stats.lifeSteal && player.hp < player.stats.maxHp) {
+                                    player.hp = Math.min(player.hp + 1, player.stats.maxHp);
+                                    spawnParticles(player.x + FW / 2, player.y + FH / 2, '#ff4488', 6);
                                 }
                             }
-                        }
+                            const pushA = Math.atan2(ncy - (player.y + FH / 2), ncx - (player.x + FW / 2));
+                            npc.knockVx = Math.cos(pushA) * player.stats.knockback * step.knockMul;
+                            npc.knockVy = Math.sin(pushA) * player.stats.knockback * step.knockMul;
+                            if (!isFinisher) player.atkHit = true;
 
-                        const reactions = npc.hp > 0
-                            ? ['You\'ll pay for that!', 'En garde!', 'That\'s it!', 'You asked for it!']
-                            : ['Argh...!', 'I yield...', 'Defeated...'];
-                        showDlg(reactions[Math.floor(Math.random() * reactions.length)]);
-                        break;
+                            spawnParticles(ncx, ncy, '#ffdd44', 10);
+                            spawnParticles(ncx, ncy, '#ffffff', 5);
+                            if (isFinisher) {
+                                // Extra impact for finisher
+                                spawnParticles(ncx, ncy, '#ff8833', 12);
+                                shakeTimer = 0.2;
+                                shakeIntensity = 8;
+                            } else {
+                                shakeTimer = 0.15;
+                                shakeIntensity = 5;
+                            }
+                            freezeTimer = HIT_FREEZE;
+
+                            // Nearby NPCs also aggro
+                            for (const other of npcs) {
+                                if (other !== npc && other.alive && !other.aggro) {
+                                    if (Math.hypot(other.x - npc.x, other.y - npc.y) < 5 * TILE) {
+                                        other.aggro = true;
+                                    }
+                                }
+                            }
+
+                            const reactions = npc.hp > 0
+                                ? ['You\'ll pay for that!', 'En garde!', 'That\'s it!', 'You asked for it!']
+                                : ['Argh...!', 'I yield...', 'Defeated...'];
+                            showDlg(reactions[Math.floor(Math.random() * reactions.length)]);
+                            if (!isFinisher) break;
+                        }
                     }
+                    if (isFinisher) player.atkHit = true;
                 }
+            }
+
+            // When attack ends, open combo window (unless finisher)
+            if (prevTimer > 0 && player.atkTimer <= 0 && player.comboStep < 2) {
+                player.comboWindow = COMBO_WINDOW;
             }
         }
         if (player.atkCooldown > 0) player.atkCooldown -= dt;
+
+        // Combo window countdown
+        if (player.comboWindow > 0) {
+            player.comboWindow -= dt;
+            if (player.comboWindow <= 0) player.comboStep = 0;
+        }
 
         // ---- Interact ----
         if (keys['Space']) {
@@ -1489,7 +1967,14 @@ async function main() {
         for (const npc of npcs) npc.update(dt, player);
 
         // ---- Projectiles ----
-        if (updateProjectiles(dt, player, npcs)) {
+        if (updateProjectiles(dt, player, npcs, (npc) => {
+            const xpAmt = npc.ranged && npc.projType === 'magic' ? 3 : 2;
+            addXp(xpAmt);
+            if (player.stats.lifeSteal && player.hp < player.stats.maxHp) {
+                player.hp = Math.min(player.hp + 1, player.stats.maxHp);
+                spawnParticles(player.x + FW / 2, player.y + FH / 2, '#ff4488', 6);
+            }
+        })) {
             gameOver = true;
             showDlg('');
         }
@@ -1535,6 +2020,9 @@ async function main() {
         // ---- Particles ----
         updateParticles(dt);
 
+        // ---- Health orbs ----
+        updateHealthOrbs(dt, player);
+
         // ---- Screen shake ----
         const savedCX = cam.x, savedCY = cam.y;
         if (shakeTimer > 0) {
@@ -1556,6 +2044,7 @@ async function main() {
         for (const npc of npcs) { drawNpcSlash(npc); drawNpcCharge(npc); }
         drawProjectiles();
         drawParticles();
+        drawHealthOrbs();
         for (const npc of npcs) { drawAggroMark(npc); drawNpcHpBar(npc); }
         drawHUD(player);
         drawDlg();
