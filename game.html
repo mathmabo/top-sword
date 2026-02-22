@@ -99,10 +99,13 @@ canvas.height = VIEW_H;
 const images = {};
 const assetList = {
     player:   '3x/NPCs/NPC 05_walk (48x72).png',
-    elf:      '3x/NPCs/Elf_walk (48x72).png',
-    npc1:     '3x/NPCs/NPC 01_walk (48x72).png',
-    npc2:     '3x/NPCs/NPC 02_walk (48x72).png',
-    npc3:     '3x/NPCs/NPC 03_walk (48x72).png',
+    // Enemies
+    goblin:     '3x/Enemies/Wildlings/Goblin_walk.png',
+    orc:        '3x/Enemies/Wildlings/Orc_walk.png',
+    skeleton:   '3x/Enemies/Undead/Skeleton_walk.png',
+    lich:       '3x/Enemies/Undead/Lich_walk.png',
+    slime:      '3x/Enemies/Bog Dwellers/Slime_move.png',
+    lizardfolk: '3x/Enemies/Bog Dwellers/Lizardfolk_walk.png',
     tree_m1:  '3x/Tileset/Tree_medium_1.png',
     tree_m2:  '3x/Tileset/Tree_medium_2.png',
     tree_s1:  '3x/Tileset/Tree_small_1.png',
@@ -320,6 +323,7 @@ class NPC extends Character {
         this.homeY = tileY * TILE;
         this.wRadius = 3 * TILE;
         // Combat
+        this.maxHp = NPC_MAX_HP;
         this.hp = NPC_MAX_HP;
         this.hitTimer = 0;
         this.hitInvuln = 0;
@@ -331,6 +335,9 @@ class NPC extends Character {
         this.atkHit = false;
         this.alive = true;
         this.respawnTimer = 0;
+        // Hostile enemies auto-aggro when player is nearby
+        this.hostile = false;
+        this.aggroRange = 5 * TILE;
         // Ranged
         this.ranged = false;
         this.projType = 'magic';
@@ -353,7 +360,7 @@ class NPC extends Character {
             this.respawnTimer -= dt;
             if (this.respawnTimer <= 0) {
                 this.alive = true;
-                this.hp = NPC_MAX_HP;
+                this.hp = this.maxHp;
                 this.x = this.homeX;
                 this.y = this.homeY;
                 this.aggro = false;
@@ -402,6 +409,11 @@ class NPC extends Character {
         }
 
         const distP = Math.hypot(player.x - this.x, player.y - this.y);
+
+        // Auto-aggro for hostile enemies
+        if (this.hostile && !this.aggro && distP < this.aggroRange) {
+            this.aggro = true;
+        }
 
         // ---- Aggro behavior ----
         if (this.aggro) {
@@ -1219,7 +1231,7 @@ function drawAggroMark(npc) {
 
 function drawNpcHpBar(npc) {
     if (!npc.alive || !npc.aggro) return;
-    const maxHp = npc.ranged && npc.projType === 'magic' ? 2 : NPC_MAX_HP;
+    const maxHp = npc.maxHp;
     const cx = Math.round(npc.x + FW / 2 - cam.x);
     const sy = Math.round(npc.y - 8 - cam.y);
     const w = 36, h = 5;
@@ -1568,21 +1580,32 @@ async function main() {
 
     let gameOver = false;
 
-    // NPCs scattered in the village
-    const elfMage = new NPC('elf', 13, 8, 'Welcome to our village, traveler!');
-    elfMage.ranged = true;
-    elfMage.projType = 'magic';
-    elfMage.hp = 2; // mages are frailer
-
-    const archer = new NPC('npc2', 23, 11, 'Watch out for monsters in the forest!');
-    archer.ranged = true;
-    archer.projType = 'arrow';
+    // Hostile enemies scattered around the map
+    function spawnEnemy(sprite, tx, ty, opts = {}) {
+        const e = new NPC(sprite, tx, ty, opts.dialogue || '...');
+        e.hostile = true;
+        e.maxHp = opts.hp || NPC_MAX_HP;
+        e.hp = e.maxHp;
+        e.speed = opts.speed || 1.0;
+        if (opts.ranged) { e.ranged = true; e.projType = opts.projType || 'magic'; }
+        if (opts.aggroRange) e.aggroRange = opts.aggroRange;
+        return e;
+    }
 
     const npcs = [
-        elfMage,
-        new NPC('npc1',  8, 11, 'The well water is fresh today.'),
-        archer,
-        new NPC('npc3', 18, 17, 'Beautiful weather, isn\'t it?'),
+        // Wildlings
+        spawnEnemy('goblin',     5, 10, { hp: 2, speed: 1.4 }),
+        spawnEnemy('goblin',    25,  7, { hp: 2, speed: 1.4 }),
+        spawnEnemy('orc',       24, 14, { hp: 4, speed: 0.9 }),
+        spawnEnemy('orc',        3, 15, { hp: 4, speed: 0.9 }),
+        // Undead
+        spawnEnemy('skeleton',  12, 19, { hp: 3 }),
+        spawnEnemy('skeleton',  20,  4, { hp: 3 }),
+        spawnEnemy('lich',      17, 10, { hp: 2, ranged: true, projType: 'magic', aggroRange: 7 * TILE }),
+        // Bog Dwellers
+        spawnEnemy('slime',      9, 14, { hp: 2, speed: 0.7 }),
+        spawnEnemy('lizardfolk', 22, 19, { hp: 3, speed: 1.1 }),
+        spawnEnemy('slime',     14,  5, { hp: 2, speed: 0.7 }),
     ];
 
     // Snap camera to player initially
@@ -1699,7 +1722,7 @@ async function main() {
                 for (const npc of npcs) {
                     npc.aggro = false;
                     npc.alive = true;
-                    npc.hp = npc.ranged && npc.projType === 'magic' ? 2 : NPC_MAX_HP;
+                    npc.hp = npc.maxHp;
                     npc.x = npc.homeX;
                     npc.y = npc.homeY;
                     npc.atkTimer = 0;
@@ -1708,6 +1731,8 @@ async function main() {
                     npc.fireQueued = false;
                     npc.knockVx = 0;
                     npc.knockVy = 0;
+                    npc.moving = false;
+                    npc.wTimer = 1 + Math.random() * 2;
                 }
             }
             renderGround();
@@ -1889,7 +1914,7 @@ async function main() {
                             npc.hp -= step.dmg;
                             npc.aggro = true;
                             if (npc.hp <= 0) {
-                                const xpAmt = npc.ranged && npc.projType === 'magic' ? 3 : 2;
+                                const xpAmt = npc.ranged ? 3 : (npc.maxHp >= 4 ? 3 : 2);
                                 addXp(xpAmt);
                                 if (player.stats.lifeSteal && player.hp < player.stats.maxHp) {
                                     player.hp = Math.min(player.hp + 1, player.stats.maxHp);
@@ -1924,8 +1949,8 @@ async function main() {
                             }
 
                             const reactions = npc.hp > 0
-                                ? ['You\'ll pay for that!', 'En garde!', 'That\'s it!', 'You asked for it!']
-                                : ['Argh...!', 'I yield...', 'Defeated...'];
+                                ? ['Grraaah!', 'You dare?!', 'Crush you!', 'No escape!']
+                                : ['Urgh...!', '*crumbles*', '...defeated...'];
                             showDlg(reactions[Math.floor(Math.random() * reactions.length)]);
                             if (!isFinisher) break;
                         }
